@@ -1,517 +1,1244 @@
+<?php
+session_start();
+
+// ==========================================
+// 1. ตั้งค่าการเชื่อมต่อฐานข้อมูล (Database Config)
+// ==========================================
+$db_host = 'localhost';
+$db_user = 'root';      // ค่าเริ่มต้นของ XAMPP
+$db_pass = '';          // ค่าเริ่มต้นของ XAMPP
+$db_name = 'bloom_app';
+
+// เชื่อมต่อ MySQL (ยังไม่ระบุฐานข้อมูล)
+$conn = new mysqli($db_host, $db_user, $db_pass);
+if ($conn->connect_error) {
+    die("Database Connection failed: " . $conn->connect_error);
+}
+
+// สร้างฐานข้อมูลอัตโนมัติถ้ายังไม่มี
+$sql_db = "CREATE DATABASE IF NOT EXISTS `$db_name` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci";
+if ($conn->query($sql_db) === TRUE) {
+    $conn->select_db($db_name);
+} else {
+    die("Error creating database: " . $conn->error);
+}
+
+// สร้างตาราง users (ผู้ใช้งานและแอดมิน)
+$sql_users = "CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    role VARCHAR(20) DEFAULT 'user',
+    cycle INT DEFAULT 28,
+    duration INT DEFAULT 5,
+    pin VARCHAR(4) DEFAULT NULL,
+    avatar LONGTEXT DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)";
+$conn->query($sql_users);
+
+// สร้างตาราง logs (เก็บประวัติสุขภาพ)
+$sql_logs = "CREATE TABLE IF NOT EXISTS logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    value TEXT NOT NULL,
+    log_date DATE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+)";
+$conn->query($sql_logs);
+
+// สร้าง Admin เริ่มต้น (username: admin / password: 1234)
+$adminCheck = $conn->query("SELECT id FROM users WHERE username = 'admin'");
+if ($adminCheck->num_rows == 0) {
+    $conn->query("INSERT INTO users (username, password, name, role) VALUES ('admin', '1234', 'Administrator', 'admin')");
+}
+
+// ==========================================
+// 2. ระบบ API Router สำหรับรองรับ Request จาก Frontend
+// ==========================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
+    header('Content-Type: application/json');
+    $input = json_decode(file_get_contents('php://input'), true);
+    $action = $_GET['api'];
+    
+    // API: สมัครสมาชิก
+    if ($action === 'register') {
+        $u = $conn->real_escape_string($input['username']);
+        $p = $input['password']; 
+        $n = $conn->real_escape_string($input['name']);
+        $c = (int)$input['cycle'];
+        $d = (int)$input['duration'];
+        
+        $check = $conn->query("SELECT id FROM users WHERE username = '$u'");
+        if($check->num_rows > 0) { 
+            echo json_encode(['success'=>false, 'msg'=>'มีชื่อผู้ใช้งานนี้ในระบบแล้ว']); exit; 
+        }
+        
+        $conn->query("INSERT INTO users (username, password, name, cycle, duration) VALUES ('$u', '$p', '$n', $c, $d)");
+        echo json_encode(['success'=>true]); exit;
+    }
+    
+    // API: เข้าสู่ระบบ
+    if ($action === 'login') {
+        $u = $conn->real_escape_string($input['username']);
+        $p = $input['password'];
+        $res = $conn->query("SELECT * FROM users WHERE username = '$u' AND password = '$p'");
+        if($res->num_rows > 0) {
+            $user = $res->fetch_assoc();
+            $_SESSION['user'] = $user;
+            echo json_encode(['success'=>true, 'user'=>$user]);
+        } else {
+            echo json_encode(['success'=>false, 'msg'=>'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง']);
+        }
+        exit;
+    }
+
+    // API: ออกจากระบบ
+    if ($action === 'logout') {
+        session_destroy();
+        echo json_encode(['success'=>true]); exit;
+    }
+
+    // --- Middleware: เช็คสถานะ Login ก่อนเข้าถึง API ด้านล่าง ---
+    if(!isset($_SESSION['user'])) { 
+        echo json_encode(['success'=>false, 'msg'=>'Unauthorized']); exit; 
+    }
+    $user_id = (int)$_SESSION['user']['id'];
+    
+    // API: แก้ไขโปรไฟล์
+    if ($action === 'update_profile') {
+        $n = $conn->real_escape_string($input['name']);
+        $c = (int)$input['cycle'];
+        $d = (int)$input['duration'];
+        
+        if (isset($input['avatar'])) {
+             $av = "'" . $conn->real_escape_string($input['avatar']) . "'";
+             $conn->query("UPDATE users SET name='$n', cycle=$c, duration=$d, avatar=$av WHERE id=$user_id");
+        } else {
+             $conn->query("UPDATE users SET name='$n', cycle=$c, duration=$d WHERE id=$user_id");
+        }
+        
+        // อัปเดต Session
+        $res = $conn->query("SELECT * FROM users WHERE id=$user_id");
+        $_SESSION['user'] = $res->fetch_assoc();
+        echo json_encode(['success'=>true, 'user'=>$_SESSION['user']]); exit;
+    }
+
+    // API: ตั้งค่ารหัส PIN
+    if ($action === 'update_pin') {
+        $pin = (isset($input['pin']) && $input['pin'] !== null) ? "'" . $conn->real_escape_string($input['pin']) . "'" : "NULL";
+        $conn->query("UPDATE users SET pin=$pin WHERE id=$user_id");
+        $res = $conn->query("SELECT * FROM users WHERE id=$user_id");
+        $_SESSION['user'] = $res->fetch_assoc();
+        echo json_encode(['success'=>true, 'user'=>$_SESSION['user']]); exit;
+    }
+    
+    // API: บันทึกข้อมูลสุขภาพรายวัน
+    if ($action === 'save_log') {
+        $type = $conn->real_escape_string($input['type']);
+        $val = $conn->real_escape_string($input['value']);
+        $date = $conn->real_escape_string($input['date']);
+        
+        // ลบข้อมูลเดิมของประเภทนั้นๆ ในวันเดียวกัน (เพื่อให้บันทึกทับ ยกเว้นน้ำและยา)
+        if(!in_array($type, ['water', 'pill'])) {
+            $conn->query("DELETE FROM logs WHERE user_id=$user_id AND log_date='$date' AND type='$type'");
+        }
+        
+        $conn->query("INSERT INTO logs (user_id, type, value, log_date) VALUES ($user_id, '$type', '$val', '$date')");
+        echo json_encode(['success'=>true]); exit;
+    }
+
+    // API: ลบข้อมูลสุขภาพ
+    if ($action === 'delete_log') {
+        $type = $conn->real_escape_string($input['type']);
+        $date = $conn->real_escape_string($input['date']);
+        
+        if($type === 'water') {
+            $conn->query("DELETE FROM logs WHERE id = (SELECT id FROM (SELECT id FROM logs WHERE user_id=$user_id AND type='water' AND log_date='$date' ORDER BY id DESC LIMIT 1) AS t)");
+        } else if ($type === 'period') {
+             $conn->query("DELETE FROM logs WHERE user_id=$user_id AND log_date='$date' AND type IN ('period', 'period_status')");
+        } else {
+            $conn->query("DELETE FROM logs WHERE user_id=$user_id AND log_date='$date' AND type='$type'");
+        }
+        echo json_encode(['success'=>true]); exit;
+    }
+    
+    // API: ดึงข้อมูลการบันทึกทั้งหมดของผู้ใช้
+    if ($action === 'get_logs') {
+        $res = $conn->query("SELECT id, type, value, log_date as date FROM logs WHERE user_id=$user_id");
+        $logs = [];
+        while($row = $res->fetch_assoc()) { $logs[] = $row; }
+        echo json_encode(['success'=>true, 'logs'=>$logs]); exit;
+    }
+
+    // --- API สำหรับผู้ดูแลระบบ (Admin) ---
+    if ($_SESSION['user']['role'] === 'admin') {
+        // ดึงสถิติรวมเข้า Dashboard
+        if ($action === 'admin_dashboard') {
+            $u_count = $conn->query("SELECT COUNT(*) as c FROM users WHERE role='user'")->fetch_assoc()['c'];
+            $l_count = $conn->query("SELECT COUNT(*) as c FROM logs")->fetch_assoc()['c'];
+            
+            $users_res = $conn->query("SELECT u.id, u.username, u.name, u.created_at, (SELECT COUNT(*) FROM logs l WHERE l.user_id = u.id) as log_count FROM users u WHERE u.role='user' ORDER BY u.created_at DESC");
+            $users = [];
+            while($row = $users_res->fetch_assoc()) { $users[] = $row; }
+            
+            echo json_encode(['success'=>true, 'total_users'=>$u_count, 'total_logs'=>$l_count, 'users'=>$users]); exit;
+        }
+        // ลบผู้ใช้งาน
+        if ($action === 'admin_delete_user') {
+            $del_id = (int)$input['id'];
+            $conn->query("DELETE FROM users WHERE id = $del_id AND role='user'");
+            echo json_encode(['success'=>true]); exit;
+        }
+    }
+    
+    echo json_encode(['success'=>false, 'msg'=>'Unknown API Action']); exit;
+}
+?>
+<!-- ========================================== -->
+<!-- 3. Frontend HTML / CSS / JS (Client App) -->
+<!-- ========================================== -->
 <!DOCTYPE html>
-<html lang="th">
+<html lang="th" class="transition-colors duration-300">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Life RPG - แดชบอร์ดอนิเมะสไตล์</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Bloom - ระบบบันทึกประจำเดือน V8 (PHP+MySQL)</title>
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     
-    <!-- Fonts: Kanit (Body) & Mali (Anime/Comic Style Headers) -->
-    <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600&family=Mali:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
+    <!-- Google Fonts: Kanit -->
+    <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Tailwind Config -->
     <script>
         tailwind.config = {
+            darkMode: 'class', 
             theme: {
                 extend: {
-                    fontFamily: {
-                        sans: ['Kanit', 'sans-serif'],
-                        anime: ['Mali', 'cursive'], // ฟอนต์สไตล์การ์ตูน
-                    },
-                    colors: {
-                        anime: {
-                            outline: '#1e1b4b', // Dark indigo for cartoon outlines
-                            pink: '#f472b6',
-                            blue: '#38bdf8',
-                            yellow: '#fbbf24',
-                            purple: '#a78bfa',
-                            bg: '#fdf4ff' // Very light fuchsia
-                        }
-                    },
-                    boxShadow: {
-                        'cartoon': '4px 4px 0px 0px #1e1b4b', // เงาทึบแบบการ์ตูน
-                        'cartoon-lg': '8px 8px 0px 0px #1e1b4b',
-                        'cartoon-hover': '2px 2px 0px 0px #1e1b4b',
-                    }
+                    fontFamily: { sans: ['Kanit', 'sans-serif'] },
+                    colors: { bloom: { light: '#FFF5F7', pink: '#FF9A9E', rose: '#FECFEF', purple: '#E2D1F9', text: '#4A4A4A', gray: '#F3F4F6' } },
+                    boxShadow: { 'soft': '0 4px 20px -2px rgba(0, 0, 0, 0.05)', 'card': '0 10px 25px -5px rgba(255, 154, 158, 0.2)' }
                 }
             }
         }
     </script>
-
+    
     <style>
-        body {
-            /* พื้นหลังไล่สีพาสเทลแบบท้องฟ้าอนิเมะ */
-            background: linear-gradient(135deg, #e0f2fe 0%, #fdf4ff 50%, #f3e8ff 100%);
-            background-attachment: fixed;
-            color: #1e1b4b;
-        }
-
-        /* การ์ดสไตล์หนังสือการ์ตูน */
-        .cartoon-card {
-            background-color: #ffffff;
-            border: 4px solid #1e1b4b;
-            border-radius: 1.5rem; /* กลมมน น่ารัก */
-            box-shadow: 6px 6px 0px 0px #1e1b4b;
-            transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-        }
-
-        /* ปุ่มสไตล์อนิเมะเด้งๆ */
-        .cartoon-btn {
-            border: 3px solid #1e1b4b;
-            border-radius: 999px;
-            box-shadow: 4px 4px 0px 0px #1e1b4b;
-            transition: all 0.15s ease-in-out;
-            font-family: 'Mali', cursive;
-            font-weight: 700;
-        }
-        .cartoon-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 6px 6px 0px 0px #1e1b4b;
-        }
-        .cartoon-btn:active {
-            transform: translateY(2px) translateX(2px);
-            box-shadow: 0px 0px 0px 0px #1e1b4b;
-        }
-
-        /* หลอดพลัง (Stat Bar) สไตล์ลูกกวาด (Candy Style) */
-        .bar-container {
-            background-color: #f1f5f9;
-            border: 3px solid #1e1b4b;
-            border-radius: 999px;
-            height: 18px; /* หนาขึ้นนิดหน่อยให้ดูการ์ตูน */
-            position: relative;
-            overflow: hidden;
-        }
+        body { background-color: #e5e7eb; transition: background-color 0.3s; }
+        html.dark body { background-color: #111827; } 
         
-        /* เอฟเฟกต์แสงสะท้อนบนหลอดพลัง */
-        .bar-shine {
-            position: absolute;
-            top: 2px;
-            left: 5px;
-            right: 5px;
-            height: 4px;
-            background: rgba(255, 255, 255, 0.4);
-            border-radius: 999px;
-            z-index: 10;
-        }
+        .app-container { max-width: 480px; margin: 0 auto; min-height: 100vh; position: relative; overflow-x: hidden; box-shadow: 0 0 25px rgba(0,0,0,0.15); }
+        .view-section { display: none; animation: fadeIn 0.3s ease-in-out; }
+        .view-section.active { display: block; flex: 1; overflow-y: auto; padding-bottom: 90px; }
+        .view-auth { display: none; }
+        .view-auth.active { display: flex; flex-direction: column; min-height: 100vh; justify-content: center; padding: 2rem; }
+        .view-admin { display: none; animation: fadeIn 0.3s ease; }
+        .view-admin.active { display: block; min-height: 100vh; padding: 1.5rem; }
 
-        /* เควสต์การ์ด เอฟเฟกต์โฮเวอร์ */
-        .quest-card {
-            border: 3px solid #1e1b4b;
-            box-shadow: 4px 4px 0px 0px rgba(30, 27, 75, 0.2);
-            transition: all 0.2s ease;
-        }
-        .quest-card:hover {
-            border-color: #1e1b4b;
-            box-shadow: 4px 4px 0px 0px #1e1b4b;
-            transform: translateY(-3px) rotate(-1deg);
-        }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pop { 0% { transform: scale(1); } 50% { transform: scale(1.2); } 100% { transform: scale(1); } }
+        @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-5px); } 75% { transform: translateX(5px); } }
+        .shake-animation { animation: shake 0.3s ease-in-out; }
 
-        /* Dialogue Box (กล่องคำพูด) */
-        .dialogue-box {
-            position: relative;
-            background: white;
-            border: 4px solid #1e1b4b;
-            border-radius: 1.5rem;
-            border-bottom-left-radius: 0.25rem; /* หางกล่องคำพูด */
-        }
+        .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); backdrop-filter: blur(3px); z-index: 50; align-items: center; justify-content: center; transition: all 0.3s;}
+        .modal.active { display: flex; animation: fadeIn 0.2s ease-out; }
+        .modal-content { border-radius: 24px; padding: 1.5rem; width: 90%; max-width: 400px; transform: scale(0.95); transition: all 0.2s; max-height: 90vh; overflow-y: auto; }
+        .modal.active .modal-content { transform: scale(1); }
         
-        /* Floating Animation สำหรับของตกแต่ง */
-        @keyframes float {
-            0% { transform: translateY(0px) rotate(0deg); }
-            50% { transform: translateY(-10px) rotate(5deg); }
-            100% { transform: translateY(0px) rotate(0deg); }
-        }
-        .animate-float {
-            animation: float 3s ease-in-out infinite;
-        }
+        .progress-ring__circle { transition: stroke-dashoffset 0.8s ease-in-out; transform: rotate(-90deg); transform-origin: 50% 50%; }
+        ::-webkit-scrollbar { width: 0px; background: transparent; }
         
-        /* Sparkle Animation */
-        @keyframes pop {
-            0% { transform: scale(0.8); opacity: 0.5; }
-            50% { transform: scale(1.2); opacity: 1; }
-            100% { transform: scale(1); opacity: 0.8; }
-        }
-        .animate-pop {
-            animation: pop 1.5s infinite alternate;
-        }
+        .btn-select { transition: all 0.2s; border: 2px solid transparent; }
+        .btn-select.selected { border-color: #FF9A9E; color: #FF9A9E; transform: scale(1.05); }
+        html:not(.dark) .btn-select.selected { background-color: #FFF0F2; }
+        html.dark .btn-select.selected { background-color: rgba(255, 154, 158, 0.1); }
+        .water-drop { transition: all 0.3s ease; cursor: pointer; }
+        .water-drop.active { color: #60A5FA; animation: pop 0.3s ease; }
+        
+        .pill-btn { transition: all 0.2s; }
+        .pill-btn.active { border-color: #34D399; }
+        html:not(.dark) .pill-btn.active { background-color: #ECFDF5; }
+        html.dark .pill-btn.active { background-color: rgba(52, 211, 153, 0.1); }
+        .pill-btn.active .pill-icon { color: #34D399; }
+        
+        .nav-btn.active { color: #FF9A9E; } 
+        html.dark .nav-btn.active { color: #FF9A9E; }
     </style>
 </head>
-<body class="min-h-screen flex flex-col font-sans antialiased pb-12">
+<body class="text-bloom-text antialiased">
 
-    <!-- Navigation Banner -->
-    <nav class="bg-white border-b-4 border-anime-outline sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-6 py-3 flex justify-between items-center">
-            <a href="#" class="text-3xl font-anime font-bold text-anime-outline tracking-wider flex items-center gap-2 group">
-                <!-- โลโก้เวทมนตร์ -->
-                <div class="bg-anime-pink text-white p-2 rounded-xl border-2 border-anime-outline transform group-hover:rotate-12 transition-transform shadow-[2px_2px_0_0_#1e1b4b]">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z"></path></svg>
+    <div class="app-container flex flex-col h-screen bg-bloom-light dark:bg-gray-900 transition-colors duration-300">
+
+        <!-- PIN Pad -->
+        <div id="pin-view" class="hidden fixed inset-0 max-w-[480px] mx-auto bg-bloom-light dark:bg-gray-900 z-[100] flex-col items-center justify-center transition-colors duration-300">
+            <div id="pin-header" class="text-center mb-8 px-6">
+                <div class="w-16 h-16 bg-white dark:bg-gray-800 rounded-full flex items-center justify-center mx-auto mb-4 text-bloom-pink text-2xl shadow-sm border border-gray-100 dark:border-gray-700"><i class="fa-solid fa-lock" id="pin-icon"></i></div>
+                <h2 id="pin-title" class="text-2xl font-bold text-gray-800 dark:text-white mb-2">กรอกรหัส PIN</h2>
+                <p id="pin-subtitle" class="text-sm text-gray-500 dark:text-gray-400">เพื่อเข้าใช้งานแอปพลิเคชัน</p>
+            </div>
+            <div class="flex gap-4 mb-10" id="pin-indicators">
+                <div class="w-4 h-4 rounded-full border-2 border-bloom-pink pin-dot transition-colors"></div><div class="w-4 h-4 rounded-full border-2 border-bloom-pink pin-dot transition-colors"></div><div class="w-4 h-4 rounded-full border-2 border-bloom-pink pin-dot transition-colors"></div><div class="w-4 h-4 rounded-full border-2 border-bloom-pink pin-dot transition-colors"></div>
+            </div>
+            <div class="grid grid-cols-3 gap-x-8 gap-y-6 text-2xl font-semibold text-gray-700 dark:text-gray-200">
+                <button onclick="app.pressPin(1)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">1</button>
+                <button onclick="app.pressPin(2)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">2</button>
+                <button onclick="app.pressPin(3)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">3</button>
+                <button onclick="app.pressPin(4)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">4</button>
+                <button onclick="app.pressPin(5)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">5</button>
+                <button onclick="app.pressPin(6)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">6</button>
+                <button onclick="app.pressPin(7)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">7</button>
+                <button onclick="app.pressPin(8)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">8</button>
+                <button onclick="app.pressPin(9)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">9</button>
+                <div></div>
+                <button onclick="app.pressPin(0)" class="w-16 h-16 rounded-full bg-white dark:bg-gray-800 shadow-sm flex items-center justify-center active:bg-bloom-pink active:text-white transition">0</button>
+                <button onclick="app.deletePin()" class="w-16 h-16 rounded-full bg-transparent flex items-center justify-center text-gray-400 hover:text-gray-600 dark:hover:text-white active:text-bloom-pink transition"><i class="fa-solid fa-delete-left"></i></button>
+            </div>
+            <button id="pin-cancel-btn" onclick="app.cancelPinAction()" class="hidden mt-8 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-sm underline">ยกเลิก</button>
+        </div>
+
+        <!-- AUTH VIEW -->
+        <div id="auth-view" class="view-auth active bg-white dark:bg-gray-900 transition-colors">
+            <div class="text-center mb-8">
+                <div class="w-20 h-20 bg-bloom-pink text-white rounded-full flex items-center justify-center mx-auto mb-4 text-4xl shadow-card"><i class="fa-solid fa-leaf"></i></div>
+                <h1 class="text-3xl font-bold text-bloom-pink mb-1">Bloom</h1>
+                <p class="text-gray-500 dark:text-gray-400 text-sm mb-2">ดูแลสุขภาพรอบเดือนของคุณทุกวัน</p>
+                <span class="inline-block px-3 py-1 bg-green-100 dark:bg-green-900/40 text-green-600 dark:text-green-400 text-xs font-semibold rounded-full"><i class="fa-solid fa-cloud mr-1"></i> เชื่อมต่อ MySQL แล้ว</span>
+            </div>
+            <!-- Login -->
+            <div id="login-form">
+                <div class="space-y-4">
+                    <div><label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">ชื่อผู้ใช้</label><input type="text" id="login-user" class="w-full p-3 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-bloom-pink bg-gray-50 dark:bg-gray-800 dark:text-white transition-colors" placeholder="Username"></div>
+                    <div><label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">รหัสผ่าน</label><input type="password" id="login-pass" class="w-full p-3 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-bloom-pink bg-gray-50 dark:bg-gray-800 dark:text-white transition-colors" placeholder="••••••••"></div>
+                    <button onclick="app.login()" class="w-full bg-bloom-pink text-white font-semibold py-3 rounded-xl shadow-card hover:opacity-90 transition mt-2">เข้าสู่ระบบ</button>
                 </div>
-                Life<span class="text-anime-blue drop-shadow-md">RPG</span>
-            </a>
-            <div class="flex gap-4 items-center text-base font-anime font-semibold">
-                <span class="text-slate-500 hidden md:inline mr-2">โย่ว! PlayerOne ✌️</span>
-                <a href="#" class="bg-anime-yellow px-4 py-1.5 rounded-full border-2 border-anime-outline shadow-[2px_2px_0_0_#1e1b4b] hover:translate-y-px transition-all">หน้าหลัก</a>
-                <a href="#" class="bg-white text-anime-outline px-4 py-1.5 rounded-full border-2 border-transparent hover:border-anime-outline transition-all">ปาร์ตี้</a>
+                <p class="text-center mt-6 text-sm text-gray-500 dark:text-gray-400">ยังไม่มีบัญชี? <a href="#" onclick="app.toggleAuth()" class="text-bloom-pink font-semibold">สมัครสมาชิก</a></p>
+            </div>
+            <!-- Register -->
+            <div id="register-form" class="hidden">
+                <div class="space-y-3">
+                    <div><label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">ชื่อเรียก / นามสกุล</label><input type="text" id="reg-name" class="w-full p-3 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-bloom-pink bg-gray-50 dark:bg-gray-800 dark:text-white transition-colors"></div>
+                    <div><label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">ชื่อผู้ใช้ (Username)</label><input type="text" id="reg-user" class="w-full p-3 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-bloom-pink bg-gray-50 dark:bg-gray-800 dark:text-white transition-colors"></div>
+                    <div><label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">รหัสผ่าน (ขั้นต่ำ 4 ตัว)</label><input type="password" id="reg-pass" class="w-full p-3 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-bloom-pink bg-gray-50 dark:bg-gray-800 dark:text-white transition-colors"></div>
+                    <div class="flex gap-4">
+                        <div class="flex-1"><label class="block text-sm font-medium mb-1 text-xs text-gray-700 dark:text-gray-300">รอบเดือน (วัน)</label><input type="number" id="reg-cycle" value="28" class="w-full p-3 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-bloom-pink bg-gray-50 dark:bg-gray-800 dark:text-white text-center transition-colors"></div>
+                        <div class="flex-1"><label class="block text-sm font-medium mb-1 text-xs text-gray-700 dark:text-gray-300">ระยะเวลา (วัน)</label><input type="number" id="reg-duration" value="5" class="w-full p-3 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-bloom-pink bg-gray-50 dark:bg-gray-800 dark:text-white text-center transition-colors"></div>
+                    </div>
+                    <button onclick="app.register()" class="w-full bg-bloom-pink text-white font-semibold py-3 rounded-xl shadow-card hover:opacity-90 transition mt-4">สร้างบัญชี</button>
+                </div>
+                <p class="text-center mt-6 text-sm text-gray-500 dark:text-gray-400">มีบัญชีอยู่แล้ว? <a href="#" onclick="app.toggleAuth()" class="text-bloom-pink font-semibold">เข้าสู่ระบบ</a></p>
             </div>
         </div>
-    </nav>
 
-    <!-- Main Content -->
-    <main class="flex-grow max-w-7xl mx-auto w-full px-4 py-8 lg:py-10">
+        <!-- MAIN APP VIEW -->
+        <div id="main-view" class="hidden flex-col h-full relative">
+            
+            <!-- Dashboard Tab -->
+            <div id="tab-dashboard" class="view-section p-5 pb-24">
+                <div class="flex justify-between items-center mb-6 pt-4">
+                    <div>
+                        <p class="text-sm text-gray-500 dark:text-gray-400" id="greeting-text">สวัสดีตอนเช้า</p>
+                        <h2 class="text-2xl font-bold text-gray-800 dark:text-white" id="user-name-display">คุณผู้ใช้</h2>
+                    </div>
+                    <div class="w-12 h-12 bg-white dark:bg-gray-800 rounded-full flex items-center justify-center shadow-soft border-2 border-bloom-light dark:border-gray-700 cursor-pointer overflow-hidden" onclick="app.switchTab('profile')">
+                        <img id="dashboard-avatar" src="https://api.dicebear.com/7.x/notionists/svg?seed=bloom" alt="avatar" class="w-full h-full object-cover">
+                    </div>
+                </div>
+
+                <div class="bg-white dark:bg-gray-800 rounded-2xl p-4 shadow-soft mb-6 transition-colors">
+                    <div class="flex justify-between items-center mb-3">
+                        <h3 class="font-semibold text-gray-700 dark:text-gray-200" id="current-month-text">เดือน/ปี</h3>
+                    </div>
+                    <div class="flex justify-between" id="weekly-calendar"></div>
+                </div>
+
+                <div class="bg-white dark:bg-gray-800 rounded-3xl p-6 shadow-soft mb-6 flex flex-col items-center justify-center relative overflow-hidden transition-colors">
+                    <div class="absolute -top-10 -left-10 w-32 h-32 bg-bloom-light dark:bg-gray-700/30 rounded-full opacity-50"></div>
+                    <div class="absolute -bottom-10 -right-10 w-32 h-32 bg-bloom-purple dark:bg-purple-900/20 rounded-full opacity-30"></div>
+                    <h3 class="font-semibold text-gray-700 dark:text-gray-200 w-full text-center mb-4 relative z-10">สถานะรอบเดือน</h3>
+                    <div class="relative w-48 h-48 flex items-center justify-center z-10">
+                        <svg class="w-full h-full" viewBox="0 0 100 100">
+                            <circle class="text-gray-100 dark:text-gray-700 stroke-current" stroke-width="8" cx="50" cy="50" r="40" fill="transparent"></circle>
+                            <circle id="cycle-ring" class="text-bloom-pink stroke-current progress-ring__circle" stroke-width="8" stroke-linecap="round" cx="50" cy="50" r="40" fill="transparent" stroke-dasharray="251.2" stroke-dashoffset="251.2"></circle>
+                        </svg>
+                        <div class="absolute flex flex-col items-center justify-center">
+                            <span class="text-4xl font-bold text-gray-800 dark:text-white" id="cycle-day-number">-</span>
+                            <span class="text-xs text-gray-500 dark:text-gray-400 font-medium" id="cycle-day-label">วันที่ของรอบเดือน</span>
+                        </div>
+                    </div>
+                    <div class="mt-4 text-center z-10">
+                        <span class="inline-block px-4 py-1.5 rounded-full bg-bloom-light dark:bg-gray-700 text-bloom-pink dark:text-bloom-pink font-semibold text-sm shadow-sm transition-colors" id="cycle-status-badge">ช่วงปกติ</span>
+                        <p class="text-xs text-gray-400 dark:text-gray-500 mt-2" id="prediction-text">คาดว่าประจำเดือนจะมาในอีก -- วัน</p>
+                    </div>
+                </div>
+
+                <div class="bg-gradient-to-r from-bloom-pink to-bloom-rose dark:from-pink-600 dark:to-purple-600 rounded-2xl p-5 shadow-card text-white mb-6">
+                    <div class="flex items-center gap-3 mb-2">
+                        <i class="fa-solid fa-lightbulb text-xl text-yellow-200"></i><h3 class="font-bold text-lg">เคล็ดลับวันนี้</h3>
+                    </div>
+                    <p class="text-sm leading-relaxed opacity-95" id="daily-insight-text">ดื่มน้ำเยอะๆ และพักผ่อนให้เพียงพอนะคะ</p>
+                </div>
+
+                <div class="bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-soft mb-6 transition-colors">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="font-semibold text-gray-700 dark:text-gray-200">ดื่มน้ำ (เป้าหมาย 8 แก้ว)</h3>
+                        <span class="text-sm font-bold text-blue-400" id="water-count-text">0 / 8</span>
+                    </div>
+                    <div class="flex justify-between items-center" id="water-tracker-container"></div>
+                </div>
+
+                <div class="flex justify-between items-end mb-3 px-1">
+                    <h3 class="font-semibold text-gray-700 dark:text-gray-200">บันทึกด่วนวันนี้</h3>
+                </div>
+                
+                <div class="grid grid-cols-3 gap-3 mb-8">
+                    <button onclick="app.openModal('symptom-modal')" class="bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-soft flex flex-col items-center justify-center gap-1 hover:bg-bloom-light dark:hover:bg-gray-700 transition border-2 border-transparent" id="btn-symptom">
+                        <div class="w-10 h-10 bg-purple-100 dark:bg-purple-900/30 text-purple-400 rounded-full flex items-center justify-center"><i class="fa-solid fa-notes-medical"></i></div>
+                        <span class="text-[11px] font-medium text-gray-600 dark:text-gray-300">อาการ</span>
+                    </button>
+                    <button onclick="app.openModal('mood-modal')" class="bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-soft flex flex-col items-center justify-center gap-1 hover:bg-bloom-light dark:hover:bg-gray-700 transition border-2 border-transparent" id="btn-mood">
+                        <div class="w-10 h-10 bg-yellow-100 dark:bg-yellow-900/30 text-yellow-500 rounded-full flex items-center justify-center"><i class="fa-solid fa-face-smile"></i></div>
+                        <span class="text-[11px] font-medium text-gray-600 dark:text-gray-300">อารมณ์</span>
+                    </button>
+                    <button onclick="app.openModal('note-modal')" class="bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-soft flex flex-col items-center justify-center gap-1 hover:bg-bloom-light dark:hover:bg-gray-700 transition border-2 border-transparent relative" id="btn-note">
+                        <div class="w-10 h-10 bg-blue-100 dark:bg-blue-900/30 text-blue-400 rounded-full flex items-center justify-center"><i class="fa-solid fa-book-journal-whills"></i></div>
+                        <span class="text-[11px] font-medium text-gray-600 dark:text-gray-300">ไดอารี่</span>
+                        <div id="note-badge" class="hidden absolute top-2 right-2 w-2.5 h-2.5 bg-blue-400 rounded-full shadow-sm"></div>
+                    </button>
+                    <button onclick="app.togglePill()" class="pill-btn bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-soft flex flex-col items-center justify-center gap-1 border-2 border-transparent relative" id="btn-pill">
+                        <div class="w-10 h-10 bg-green-50 dark:bg-green-900/30 text-green-400 rounded-full flex items-center justify-center pill-icon"><i class="fa-solid fa-pills"></i></div>
+                        <span class="text-[11px] font-medium text-gray-600 dark:text-gray-300">กินยา</span>
+                        <div id="pill-badge" class="hidden absolute top-2 right-2 text-green-500 text-xs"><i class="fa-solid fa-circle-check"></i></div>
+                    </button>
+                    <button onclick="app.openModal('bbt-modal')" class="bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-soft flex flex-col items-center justify-center gap-1 hover:bg-bloom-light dark:hover:bg-gray-700 transition border-2 border-transparent relative" id="btn-bbt">
+                        <div class="w-10 h-10 bg-orange-100 dark:bg-orange-900/30 text-orange-400 rounded-full flex items-center justify-center"><i class="fa-solid fa-temperature-half"></i></div>
+                        <span class="text-[11px] font-medium text-gray-600 dark:text-gray-300">อุณหภูมิ</span>
+                        <div id="bbt-badge" class="hidden absolute top-2 right-2 text-orange-500 text-xs"><i class="fa-solid fa-circle-check"></i></div>
+                    </button>
+                    <button onclick="app.openModal('weight-modal')" class="bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-soft flex flex-col items-center justify-center gap-1 hover:bg-bloom-light dark:hover:bg-gray-700 transition border-2 border-transparent relative" id="btn-weight">
+                        <div class="w-10 h-10 bg-teal-100 dark:bg-teal-900/30 text-teal-500 rounded-full flex items-center justify-center"><i class="fa-solid fa-weight-scale"></i></div>
+                        <span class="text-[11px] font-medium text-gray-600 dark:text-gray-300">น้ำหนัก</span>
+                        <div id="weight-badge" class="hidden absolute top-2 right-2 text-teal-500 text-xs"><i class="fa-solid fa-circle-check"></i></div>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Calendar Tab -->
+            <div id="tab-calendar" class="view-section p-5">
+                <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-6 pt-4">ปฏิทิน</h2>
+                <div class="bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-soft mb-6 transition-colors">
+                    <div class="flex justify-between items-center mb-6">
+                        <button onclick="app.changeMonth(-1)" class="w-8 h-8 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300"><i class="fa-solid fa-chevron-left text-sm"></i></button>
+                        <h3 class="font-bold text-lg text-gray-700 dark:text-gray-200" id="calendar-month-year">เดือน/ปี</h3>
+                        <button onclick="app.changeMonth(1)" class="w-8 h-8 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-600 dark:text-gray-300"><i class="fa-solid fa-chevron-right text-sm"></i></button>
+                    </div>
+                    <div class="grid grid-cols-7 text-center text-xs font-semibold text-gray-400 dark:text-gray-500 mb-2">
+                        <div>อา</div><div>จ</div><div>อ</div><div>พ</div><div>พฤ</div><div>ศ</div><div>ส</div>
+                    </div>
+                    <div id="full-calendar-grid" class="grid grid-cols-7 gap-y-4 gap-x-1 text-center text-sm"></div>
+                </div>
+                <div class="bg-white dark:bg-gray-800 rounded-2xl p-4 shadow-soft transition-colors">
+                    <h4 class="text-xs font-bold text-gray-400 dark:text-gray-500 mb-3 uppercase tracking-wider">สัญลักษณ์</h4>
+                    <div class="grid grid-cols-2 gap-3 text-sm text-gray-600 dark:text-gray-300">
+                        <div class="flex items-center gap-2"><div class="w-3 h-3 rounded-full bg-bloom-pink"></div> มีประจำเดือน</div>
+                        <div class="flex items-center gap-2"><div class="w-3 h-3 rounded-full border-2 border-dashed border-bloom-pink"></div> คาดการณ์</div>
+                        <div class="flex items-center gap-2"><div class="text-yellow-400 text-xs"><i class="fa-solid fa-star"></i></div> วันไข่ตก</div>
+                        <div class="flex items-center gap-2"><div class="w-2 h-2 rounded-full bg-purple-400"></div> มีการบันทึก</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stats Tab -->
+            <div id="tab-stats" class="view-section p-5">
+                <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-6 pt-4">ข้อมูลเชิงลึก</h2>
+                <div class="grid grid-cols-2 gap-4 mb-6">
+                    <div class="bg-white dark:bg-gray-800 p-4 rounded-2xl shadow-soft text-center border-t-4 border-bloom-pink transition-colors">
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mb-1">รอบเดือนเฉลี่ย</p>
+                        <p class="text-2xl font-bold text-gray-800 dark:text-white"><span id="stat-avg-cycle">28</span> <span class="text-sm font-normal text-gray-500">วัน</span></p>
+                    </div>
+                    <div class="bg-white dark:bg-gray-800 p-4 rounded-2xl shadow-soft text-center border-t-4 border-bloom-rose dark:border-purple-400 transition-colors">
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mb-1">ระยะเวลามาเฉลี่ย</p>
+                        <p class="text-2xl font-bold text-gray-800 dark:text-white"><span id="stat-avg-duration">5</span> <span class="text-sm font-normal text-gray-500">วัน</span></p>
+                    </div>
+                </div>
+                <div class="bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-soft mb-6 transition-colors">
+                    <h3 class="font-semibold text-gray-700 dark:text-gray-200 mb-4">ประวัติความยาวรอบเดือน</h3>
+                    <canvas id="cycleChart" height="200"></canvas>
+                </div>
+                <div class="bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-soft mb-6 transition-colors">
+                    <h3 class="font-semibold text-gray-700 dark:text-gray-200 mb-4">สรุปสิ่งที่พบบ่อย</h3>
+                    <div class="mb-4">
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mb-2"><i class="fa-solid fa-notes-medical text-purple-400 mr-1"></i> อาการยอดฮิต (Top 3)</p>
+                        <div id="top-symptoms" class="flex flex-wrap gap-2"></div>
+                    </div>
+                    <div>
+                        <p class="text-sm text-gray-500 dark:text-gray-400 mb-2"><i class="fa-solid fa-face-smile text-yellow-400 mr-1"></i> อารมณ์ยอดฮิต (Top 3)</p>
+                        <div id="top-moods" class="flex flex-wrap gap-2"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Profile Tab -->
+            <div id="tab-profile" class="view-section p-5">
+                <h2 class="text-2xl font-bold text-gray-800 dark:text-white mb-6 pt-4">ฉัน</h2>
+                <div class="bg-white dark:bg-gray-800 rounded-3xl p-6 shadow-soft text-center mb-6 border border-bloom-light dark:border-gray-700 relative transition-colors">
+                    <button onclick="app.openModal('edit-profile-modal')" class="absolute top-4 right-4 text-gray-400 hover:text-bloom-pink"><i class="fa-solid fa-pen"></i></button>
+                    
+                    <div class="relative w-24 h-24 mx-auto mb-4 group">
+                        <div class="w-24 h-24 bg-bloom-light dark:bg-gray-700 rounded-full flex items-center justify-center border-4 border-white dark:border-gray-800 shadow-sm overflow-hidden transition-colors cursor-pointer" onclick="document.getElementById('avatar-upload').click()">
+                            <img id="profile-avatar" src="https://api.dicebear.com/7.x/notionists/svg?seed=bloom" alt="avatar" class="w-full h-full object-cover">
+                        </div>
+                        <div class="absolute bottom-0 right-0 bg-bloom-pink text-white w-7 h-7 rounded-full flex items-center justify-center shadow-sm cursor-pointer border-2 border-white dark:border-gray-800 hover:bg-pink-500 transition" onclick="document.getElementById('avatar-upload').click()">
+                            <i class="fa-solid fa-camera text-xs"></i>
+                        </div>
+                        <input type="file" id="avatar-upload" class="hidden" accept="image/*" onchange="app.handleAvatarUpload(event)">
+                    </div>
+
+                    <h3 class="font-bold text-xl text-gray-800 dark:text-white" id="profile-name">คุณผู้ใช้</h3>
+                    <p class="text-gray-500 dark:text-gray-400 text-sm mb-4" id="profile-user">@username</p>
+                    <div class="flex justify-center gap-4 text-sm text-gray-600 dark:text-gray-300 bg-gray-50 dark:bg-gray-700/50 p-3 rounded-xl transition-colors">
+                        <div><span class="font-bold text-bloom-pink" id="profile-cycle">28</span><br><span class="text-[10px]">รอบเดือน(วัน)</span></div>
+                        <div class="w-px bg-gray-200 dark:bg-gray-600"></div>
+                        <div><span class="font-bold text-bloom-pink" id="profile-duration">5</span><br><span class="text-[10px]">ระยะเวลา(วัน)</span></div>
+                    </div>
+                </div>
+
+                <h3 class="font-semibold text-gray-700 dark:text-gray-300 mb-3 px-1 text-sm">ตั้งค่าความปลอดภัย (Security)</h3>
+                <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 p-4 mb-3 flex justify-between items-center transition-colors">
+                    <div class="flex items-center gap-3 text-gray-700 dark:text-gray-200">
+                        <div class="w-8 h-8 rounded-full bg-indigo-50 dark:bg-indigo-900/30 text-indigo-500 flex items-center justify-center"><i class="fa-solid fa-moon"></i></div>
+                        <span class="font-medium text-sm">โหมดกลางคืน (Dark Mode)</span>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" id="theme-toggle" class="sr-only peer" onchange="app.toggleTheme()">
+                        <div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-indigo-500"></div>
+                    </label>
+                </div>
+                <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 p-4 mb-6 flex justify-between items-center cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors" onclick="app.startPinSetupFlow()">
+                    <div class="flex items-center gap-3 text-gray-700 dark:text-gray-200">
+                        <div class="w-8 h-8 rounded-full bg-red-50 dark:bg-red-900/30 text-red-500 flex items-center justify-center"><i class="fa-solid fa-shield-halved"></i></div>
+                        <span class="font-medium text-sm">รหัสล็อคแอป (PIN)</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span id="pin-status-badge" class="text-xs px-2 py-1 bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 rounded-full font-medium">ปิดใช้งาน</span>
+                        <i class="fa-solid fa-chevron-right text-gray-300 text-xs"></i>
+                    </div>
+                </div>
+                
+                <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden mt-4 transition-colors">
+                    <button onclick="app.logout()" class="w-full flex items-center justify-between p-4 hover:bg-red-50 dark:hover:bg-red-900/20 transition text-left">
+                        <div class="flex items-center gap-3 text-red-500">
+                            <div class="w-8 h-8 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 flex items-center justify-center"><i class="fa-solid fa-right-from-bracket"></i></div>
+                            <span class="font-medium text-sm">ออกจากระบบ</span>
+                        </div>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Bottom Nav -->
+            <div class="fixed bottom-0 w-full max-w-md bg-white dark:bg-gray-800 border-t border-gray-100 dark:border-gray-700 px-6 py-3 flex justify-between items-center rounded-t-3xl shadow-[0_-10px_20px_rgba(0,0,0,0.03)] z-40 transition-colors">
+                <button onclick="app.switchTab('dashboard')" class="nav-btn flex flex-col items-center gap-1 text-gray-400 dark:text-gray-500 hover:text-bloom-pink transition active" data-tab="dashboard">
+                    <i class="fa-solid fa-house text-xl mb-1"></i><span class="text-[10px] font-medium">หน้าหลัก</span>
+                </button>
+                <button onclick="app.switchTab('calendar')" class="nav-btn flex flex-col items-center gap-1 text-gray-400 dark:text-gray-500 hover:text-bloom-pink transition" data-tab="calendar">
+                    <i class="fa-regular fa-calendar text-xl mb-1"></i><span class="text-[10px] font-medium">ปฏิทิน</span>
+                </button>
+                <div class="relative -top-6">
+                    <button onclick="app.openModal('period-modal')" class="bg-bloom-pink text-white w-14 h-14 rounded-full flex items-center justify-center shadow-card border-4 border-white dark:border-gray-800 transform hover:scale-105 transition active:scale-95">
+                        <i class="fa-solid fa-droplet text-2xl"></i>
+                    </button>
+                </div>
+                <button onclick="app.switchTab('stats')" class="nav-btn flex flex-col items-center gap-1 text-gray-400 dark:text-gray-500 hover:text-bloom-pink transition" data-tab="stats">
+                    <i class="fa-solid fa-chart-pie text-xl mb-1"></i><span class="text-[10px] font-medium">สถิติ</span>
+                </button>
+                <button onclick="app.switchTab('profile')" class="nav-btn flex flex-col items-center gap-1 text-gray-400 dark:text-gray-500 hover:text-bloom-pink transition" data-tab="profile">
+                    <i class="fa-regular fa-user text-xl mb-1"></i><span class="text-[10px] font-medium">ฉัน</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- ADMIN DASHBOARD -->
+        <div id="admin-view" class="view-admin bg-gray-50 dark:bg-gray-900 transition-colors">
+            <div class="flex justify-between items-center mb-8 bg-white dark:bg-gray-800 p-4 rounded-2xl shadow-sm border dark:border-gray-700">
+                <div>
+                    <h2 class="text-xl font-bold text-gray-800 dark:text-white">Admin Dashboard</h2>
+                    <p class="text-sm text-gray-500 dark:text-gray-400">ระบบจัดการผู้ใช้งานแอป Bloom</p>
+                </div>
+                <button onclick="app.logout()" class="text-red-500 bg-red-50 w-10 h-10 rounded-full hover:bg-red-100"><i class="fa-solid fa-right-from-bracket"></i></button>
+            </div>
+            <div class="grid grid-cols-2 gap-4 mb-8">
+                <div class="bg-white dark:bg-gray-800 p-5 rounded-2xl shadow-soft text-center border dark:border-gray-700"><p class="text-3xl font-bold dark:text-white text-blue-500" id="admin-total-users">0</p><p class="text-xs text-gray-400">ผู้ใช้งานทั้งหมด</p></div>
+                <div class="bg-white dark:bg-gray-800 p-5 rounded-2xl shadow-soft text-center border dark:border-gray-700"><p class="text-3xl font-bold dark:text-white text-green-500" id="admin-total-logs">0</p><p class="text-xs text-gray-400">รายการบันทึก</p></div>
+            </div>
+            <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-soft overflow-hidden border dark:border-gray-700">
+                <div class="p-4 border-b dark:border-gray-700 bg-gray-50 dark:bg-gray-800"><h3 class="font-bold text-gray-700 dark:text-gray-200">รายชื่อสมาชิก</h3></div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-sm">
+                        <thead class="text-xs text-gray-500 bg-gray-50 dark:bg-gray-900/50"><tr><th class="p-3">ข้อมูลผู้ใช้</th><th class="p-3 text-center">จำนวนการบันทึก</th><th class="p-3 text-center">จัดการ</th></tr></thead>
+                        <tbody id="admin-user-list" class="divide-y divide-gray-100 dark:divide-gray-700"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ================= MODALS ================= -->
         
-        <!-- Flash Message (สไตล์กล่องคำพูดอนิเมะ) -->
-        <div class="dialogue-box p-4 mb-8 hidden shadow-[4px_4px_0_0_#1e1b4b] flex items-center gap-4 max-w-2xl" id="flash-msg">
-            <div class="w-12 h-12 bg-emerald-300 rounded-full border-2 border-anime-outline flex items-center justify-center shrink-0 text-2xl animate-bounce">
-                🎉
-            </div>
-            <div>
-                <h4 class="font-anime font-bold text-lg text-anime-outline">ระบบแจ้งเตือน!</h4>
-                <p class="font-medium text-slate-700" id="flash-text">ทำภารกิจสำเร็จ! ได้รับ +20 XP สุดยอดไปเลย!</p>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
-            
-            <!-- Left Column: Character Profile & Stats -->
-            <div class="lg:col-span-4 space-y-8">
-                
-                <!-- Profile Card -->
-                <div class="cartoon-card p-6 text-center relative overflow-visible mt-4">
-                    
-                    <!-- Decor: Stars -->
-                    <div class="absolute -top-6 -left-4 text-4xl animate-pop">✨</div>
-                    <div class="absolute -bottom-4 -right-4 text-3xl animate-float">🌟</div>
-
-                    <!-- Streak Badge -->
-                    <div class="absolute -top-4 right-4 bg-red-400 text-white font-anime text-sm font-bold px-4 py-1.5 rounded-full border-2 border-anime-outline shadow-[2px_2px_0_0_#1e1b4b] flex items-center gap-1 transform rotate-3">
-                        🔥 7 วันต่อเนื่อง!
-                    </div>
-                    
-                    <!-- Anime Avatar (using Lorelei style from Dicebear for anime eyes/hair) -->
-                    <div class="w-32 h-32 mx-auto bg-anime-blue/20 rounded-full mb-4 relative group cursor-pointer border-4 border-anime-outline shadow-[4px_4px_0_0_#1e1b4b] mt-2 bg-gradient-to-t from-anime-pink/30 to-transparent">
-                        <img src="https://api.dicebear.com/7.x/lorelei/svg?seed=PlayerOne&backgroundColor=transparent" alt="Profile" class="w-full h-full rounded-full object-cover">
-                        <!-- Edit Button Overlay -->
-                        <div class="absolute bottom-0 right-0 bg-anime-yellow w-8 h-8 rounded-full border-2 border-anime-outline flex items-center justify-center text-anime-outline hover:scale-110 transition-transform">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
-                        </div>
-                    </div>
-                    
-                    <h2 class="text-3xl font-anime font-bold text-anime-outline mb-1">PlayerOne</h2>
-                    <div class="inline-block bg-slate-100 px-3 py-1 rounded-lg border-2 border-slate-300 text-sm font-bold text-slate-600 mb-6 font-anime">
-                        🔰 ผู้กล้าฝึกหัด • เลเวล 5
-                    </div>
-                    
-                    <!-- Main XP Progress -->
-                    <div class="text-left mb-2 flex justify-between text-sm font-anime font-bold text-slate-700 uppercase">
-                        <span>ค่าประสบการณ์ (XP)</span>
-                        <span class="text-anime-pink">850 / 1118</span>
-                    </div>
-                    <div class="bar-container w-full h-5 bg-white">
-                        <div class="bg-anime-pink h-full border-r-2 border-anime-outline transition-all duration-1000 ease-out relative" style="width: 76%">
-                            <!-- Candy Shine Effect -->
-                            <div class="absolute top-1 left-2 right-2 h-1.5 bg-white/40 rounded-full"></div>
-                        </div>
-                    </div>
+        <!-- Period Modal -->
+        <div id="period-modal" class="modal">
+            <div class="modal-content bg-white dark:bg-gray-800 transition-colors border dark:border-gray-700">
+                <div class="flex justify-between items-center mb-4">
+                    <h3 class="text-lg font-bold text-gray-800 dark:text-white flex items-center gap-2"><i class="fa-solid fa-droplet text-bloom-pink"></i> บันทึกประจำเดือน</h3>
+                    <button onclick="app.closeModal('period-modal')" class="text-gray-400 hover:text-gray-700"><i class="fa-solid fa-xmark text-xl"></i></button>
                 </div>
-
-                <!-- Stats Details -->
-                <div class="cartoon-card p-6 relative">
-                    <!-- Cute pin detail -->
-                    <div class="absolute -top-3 left-1/2 -translate-x-1/2 w-12 h-6 bg-anime-yellow border-2 border-anime-outline rounded-full shadow-[2px_2px_0_0_#1e1b4b] z-10 flex items-center justify-center">
-                        <div class="w-2 h-2 bg-white rounded-full"></div>
-                    </div>
-
-                    <h3 class="font-anime font-bold text-xl text-anime-outline mb-6 text-center mt-2">
-                        📊 สเตตัสตัวละคร
-                    </h3>
-                    
-                    <div class="space-y-4 font-anime font-semibold">
-                        <!-- Stat Item (Health) -->
-                        <div>
-                            <div class="flex justify-between text-[15px] mb-1">
-                                <span class="flex items-center gap-2">❤️ สุขภาพ</span>
-                                <span class="text-slate-500">Lv.4</span>
-                            </div>
-                            <div class="bar-container h-4"><div class="bg-red-400 h-full border-r-2 border-anime-outline" style="width: 45%"><div class="bar-shine"></div></div></div>
-                        </div>
-                        
-                        <!-- Stat Item (Finance) -->
-                        <div>
-                            <div class="flex justify-between text-[15px] mb-1">
-                                <span class="flex items-center gap-2">💰 การเงิน</span>
-                                <span class="text-slate-500">Lv.3</span>
-                            </div>
-                            <div class="bar-container h-4"><div class="bg-yellow-400 h-full border-r-2 border-anime-outline" style="width: 80%"><div class="bar-shine"></div></div></div>
-                        </div>
-
-                        <!-- Stat Item (Knowledge) -->
-                        <div>
-                            <div class="flex justify-between text-[15px] mb-1">
-                                <span class="flex items-center gap-2">📖 ความรู้</span>
-                                <span class="text-slate-500">Lv.6</span>
-                            </div>
-                            <div class="bar-container h-4"><div class="bg-blue-400 h-full border-r-2 border-anime-outline" style="width: 20%"><div class="bar-shine"></div></div></div>
-                        </div>
-
-                        <!-- Stat Item (Work) -->
-                        <div>
-                            <div class="flex justify-between text-[15px] mb-1">
-                                <span class="flex items-center gap-2">⚔️ การงาน</span>
-                                <span class="text-slate-500">Lv.4</span>
-                            </div>
-                            <div class="bar-container h-4"><div class="bg-orange-400 h-full border-r-2 border-anime-outline" style="width: 60%"><div class="bar-shine"></div></div></div>
-                        </div>
-                    </div>
+                <p class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2 mt-2">ปริมาณเลือด (Blood Flow)</p>
+                <div class="grid grid-cols-4 gap-2 mb-4" id="period_flow-options">
+                    <button onclick="app.selectOption('period_flow', 'spotting', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-2 rounded-xl flex flex-col items-center justify-center gap-1 text-gray-600 dark:text-gray-300 h-16"><div class="text-bloom-pink opacity-40"><i class="fa-solid fa-droplet text-xs"></i></div><span class="text-[10px] font-medium">กะปริบกะปรอย</span></button>
+                    <button onclick="app.selectOption('period_flow', 'light', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-2 rounded-xl flex flex-col items-center justify-center gap-1 text-gray-600 dark:text-gray-300 h-16"><div class="text-bloom-pink opacity-60"><i class="fa-solid fa-droplet"></i></div><span class="text-[10px] font-medium">มาน้อย</span></button>
+                    <button onclick="app.selectOption('period_flow', 'medium', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-2 rounded-xl flex flex-col items-center justify-center gap-1 text-gray-600 dark:text-gray-300 h-16"><div class="text-bloom-pink opacity-80"><i class="fa-solid fa-droplet"></i><i class="fa-solid fa-droplet"></i></div><span class="text-[10px] font-medium">ปานกลาง</span></button>
+                    <button onclick="app.selectOption('period_flow', 'heavy', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-2 rounded-xl flex flex-col items-center justify-center gap-1 text-gray-600 dark:text-gray-300 h-16"><div class="text-bloom-pink"><i class="fa-solid fa-droplet"></i><i class="fa-solid fa-droplet"></i><i class="fa-solid fa-droplet"></i></div><span class="text-[10px] font-medium">มามาก</span></button>
                 </div>
-                
-                <!-- Achievements (Badges) -->
-                <div class="cartoon-card p-5 bg-anime-purple/10">
-                    <h3 class="font-anime font-bold text-lg text-anime-outline mb-4 text-center">
-                        🏆 เหรียญตราความสำเร็จ
-                    </h3>
-                    <div class="flex gap-3">
-                        <!-- Unlocked Badge 1 -->
-                        <div class="flex-1 bg-white border-3 border-anime-outline rounded-2xl p-2 flex flex-col items-center justify-center shadow-[2px_2px_0_0_#1e1b4b] transform hover:scale-110 transition-transform">
-                            <div class="text-3xl mb-1 drop-shadow-md">💪</div>
-                            <span class="font-anime text-xs font-bold text-slate-800">จอมพลัง</span>
-                        </div>
-                        <!-- Unlocked Badge 2 -->
-                        <div class="flex-1 bg-white border-3 border-anime-outline rounded-2xl p-2 flex flex-col items-center justify-center shadow-[2px_2px_0_0_#1e1b4b] transform hover:scale-110 transition-transform">
-                            <div class="text-3xl mb-1 drop-shadow-md">🧠</div>
-                            <span class="font-anime text-xs font-bold text-slate-800">นักปราชญ์</span>
-                        </div>
-                        <!-- Locked Badge -->
-                        <div class="flex-1 bg-slate-100 border-3 border-slate-300 rounded-2xl p-2 flex flex-col items-center justify-center grayscale opacity-60">
-                            <div class="text-3xl mb-1">🔒</div>
-                            <span class="font-anime text-xs font-bold text-slate-500">ยังไม่ปลดล็อก</span>
-                        </div>
-                    </div>
+                <p class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">ลักษณะ (Characteristics)</p>
+                <div class="grid grid-cols-2 gap-3 mb-6" id="period_status-options">
+                    <button onclick="app.selectOption('period_status', 'normal', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center justify-center gap-2 text-gray-600 dark:text-gray-300"><i class="fa-solid fa-circle-check text-green-400"></i><span class="text-xs font-medium">มาปกติ</span></button>
+                    <button onclick="app.selectOption('period_status', 'abnormal', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center justify-center gap-2 text-gray-600 dark:text-gray-300"><i class="fa-solid fa-triangle-exclamation text-red-400"></i><span class="text-xs font-medium">ผิดปกติ / มีลิ่มเลือด</span></button>
                 </div>
-
-            </div>
-
-            <!-- Right Column: Quests -->
-            <div class="lg:col-span-8 space-y-6">
-                <div class="cartoon-card p-6 lg:p-8 bg-white/90 backdrop-blur-sm">
-                    
-                    <!-- Header -->
-                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4 border-b-4 border-slate-100 pb-6">
-                        <div>
-                            <h2 class="text-3xl font-anime font-bold text-anime-outline flex items-center gap-3">
-                                📜 กระดานเควสต์ <span class="animate-bounce">📌</span>
-                            </h2>
-                            <p class="text-base text-slate-600 mt-1 font-medium">พิชิตภารกิจรายวันเพื่อรับรางวัลมากมาย!</p>
-                        </div>
-                        <button onclick="toggleCustomQuestForm()" class="cartoon-btn bg-anime-blue text-white px-6 py-3 flex items-center gap-2 text-lg hover:bg-blue-400">
-                            <span class="text-xl">+</span> สร้างเควสต์
-                        </button>
-                    </div>
-
-                    <!-- Custom Quest Form (Hidden by default) -->
-                    <div id="customQuestForm" class="hidden mb-8 bg-anime-blue/10 p-6 rounded-3xl border-3 border-anime-blue/30 relative overflow-hidden">
-                        <div class="absolute top-0 right-0 w-32 h-32 bg-white/20 rounded-full -translate-y-1/2 translate-x-1/2 blur-2xl"></div>
-                        
-                        <h4 class="font-anime font-bold text-anime-outline mb-4 text-lg">✨ กำหนดเป้าหมายการผจญภัยใหม่!</h4>
-                        <form onsubmit="handleQuestSubmit(event)" class="grid grid-cols-1 md:grid-cols-4 gap-4 relative z-10">
-                            <div class="md:col-span-2">
-                                <input type="text" placeholder="ชื่อภารกิจ (เช่น ดันเจี้ยนวิ่ง 3 กม.)" required class="w-full bg-white border-3 border-anime-outline rounded-xl px-4 py-3 text-base font-medium focus:outline-none focus:ring-4 focus:ring-anime-blue/30 shadow-[inset_0_2px_4px_rgba(0,0,0,0.05)]">
-                            </div>
-                            <div>
-                                <select class="w-full bg-white border-3 border-anime-outline rounded-xl px-4 py-3 text-base font-anime font-bold text-slate-700 focus:outline-none focus:ring-4 focus:ring-anime-blue/30 appearance-none cursor-pointer">
-                                    <option value="health">❤️ สุขภาพ</option>
-                                    <option value="finance">💰 การเงิน</option>
-                                    <option value="knowledge">📖 ความรู้</option>
-                                    <option value="work">⚔️ การงาน</option>
-                                </select>
-                            </div>
-                            <div class="flex items-end">
-                                <button type="submit" class="cartoon-btn bg-anime-pink text-white py-3 px-4 w-full text-lg hover:bg-pink-400">
-                                    บันทึก!
-                                </button>
-                            </div>
-                        </form>
-                    </div>
-
-                    <!-- Active Quests -->
-                    <div class="space-y-4 mb-10">
-                        
-                        <!-- Quest Item 1 (Health) -->
-                        <div class="quest-card bg-white rounded-2xl p-5 flex flex-col sm:flex-row justify-between items-start sm:items-center relative group">
-                            <div class="absolute top-0 left-0 w-3 h-full bg-red-400 rounded-l-xl border-r-2 border-anime-outline"></div>
-                            
-                            <div class="pl-6 mb-4 sm:mb-0">
-                                <div class="flex items-center gap-3 mb-1">
-                                    <h4 class="font-anime font-bold text-anime-outline text-xl">ดื่มน้ำแห่งชีวิต (8 แก้ว)</h4>
-                                    <span class="bg-red-100 text-red-600 border-2 border-red-300 text-xs px-2.5 py-1 rounded-full font-bold">ฮีลลิ่ง ❤️</span>
-                                </div>
-                                <p class="text-sm font-medium text-slate-500">ฟื้นฟู HP ร่างกายด้วยการดื่มน้ำให้เพียงพอ</p>
-                            </div>
-                            <div class="pl-6 sm:pl-0 sm:text-right flex items-center justify-between sm:justify-end gap-4 w-full sm:w-auto">
-                                <div class="text-anime-outline font-anime font-bold text-lg flex items-center gap-1.5 bg-yellow-100 px-4 py-2 rounded-xl border-2 border-yellow-400 shadow-sm transform -rotate-2">
-                                    ⭐ 15 XP
-                                </div>
-                                <button onclick="completeQuest(this)" class="cartoon-btn bg-emerald-400 text-white text-base px-6 py-2.5 hover:bg-emerald-300 active:bg-emerald-500">
-                                    สำเร็จ!
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Quest Item 2 (Knowledge) -->
-                        <div class="quest-card bg-white rounded-2xl p-5 flex flex-col sm:flex-row justify-between items-start sm:items-center relative group">
-                            <div class="absolute top-0 left-0 w-3 h-full bg-blue-400 rounded-l-xl border-r-2 border-anime-outline"></div>
-                            <div class="pl-6 mb-4 sm:mb-0">
-                                <div class="flex items-center gap-3 mb-1">
-                                    <h4 class="font-anime font-bold text-anime-outline text-xl">อ่านคัมภีร์เวท (1 บท)</h4>
-                                    <span class="bg-blue-100 text-blue-600 border-2 border-blue-300 text-xs px-2.5 py-1 rounded-full font-bold">ปัญญา 📖</span>
-                                </div>
-                                <p class="text-sm font-medium text-slate-500">อัปเกรดค่า INT ด้วยหนังสือพัฒนาตนเอง</p>
-                            </div>
-                            <div class="pl-6 sm:pl-0 sm:text-right flex items-center justify-between sm:justify-end gap-4 w-full sm:w-auto">
-                                <div class="text-anime-outline font-anime font-bold text-lg flex items-center gap-1.5 bg-yellow-100 px-4 py-2 rounded-xl border-2 border-yellow-400 shadow-sm transform 2">
-                                    ⭐ 25 XP
-                                </div>
-                                <button onclick="completeQuest(this)" class="cartoon-btn bg-emerald-400 text-white text-base px-6 py-2.5 hover:bg-emerald-300 active:bg-emerald-500">
-                                    สำเร็จ!
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Custom Quest Item (Finance) -->
-                        <div class="quest-card bg-white rounded-2xl p-5 flex flex-col sm:flex-row justify-between items-start sm:items-center relative group">
-                            <div class="absolute top-0 left-0 w-3 h-full bg-yellow-400 rounded-l-xl border-r-2 border-anime-outline"></div>
-                            <div class="pl-6 mb-4 sm:mb-0">
-                                <div class="flex items-center gap-3 mb-1">
-                                    <h4 class="font-anime font-bold text-anime-outline text-xl">เก็บเสบียงทองคำ (100 บาท)</h4>
-                                    <div class="flex gap-2">
-                                        <span class="bg-yellow-100 text-yellow-700 border-2 border-yellow-400 text-xs px-2.5 py-1 rounded-full font-bold">การเงิน 💰</span>
-                                        <span class="bg-slate-200 text-slate-600 border-2 border-slate-300 text-xs px-2.5 py-1 rounded-full font-bold">เควสต์เสริม</span>
-                                    </div>
-                                </div>
-                                <p class="text-sm font-medium text-slate-500">สร้างคลังสมบัติส่วนตัววันละนิด</p>
-                            </div>
-                            <div class="pl-6 sm:pl-0 sm:text-right flex items-center justify-between sm:justify-end gap-4 w-full sm:w-auto">
-                                <div class="text-anime-outline font-anime font-bold text-lg flex items-center gap-1.5 bg-yellow-100 px-4 py-2 rounded-xl border-2 border-yellow-400 shadow-sm transform -rotate-1">
-                                    ⭐ 10 XP
-                                </div>
-                                <button onclick="completeQuest(this)" class="cartoon-btn bg-emerald-400 text-white text-base px-6 py-2.5 hover:bg-emerald-300 active:bg-emerald-500">
-                                    สำเร็จ!
-                                </button>
-                            </div>
-                        </div>
-
-                    </div>
-
-                    <!-- Completed Quests -->
-                    <h4 class="font-anime font-bold text-slate-400 mb-4 text-lg flex items-center gap-2 border-t-4 border-slate-100 pt-6">
-                        <span>💤 เควสต์ที่เคลียร์แล้ววันนี้</span>
-                    </h4>
-                    <div class="space-y-3">
-                        
-                        <!-- Completed Item -->
-                        <div class="bg-slate-50 border-3 border-slate-200 rounded-2xl p-4 flex justify-between items-center opacity-70 grayscale-[30%]">
-                            <div class="flex items-center gap-3 pl-2">
-                                <div class="text-2xl">⚔️</div>
-                                <h4 class="font-anime font-bold text-slate-500 line-through text-lg">ฝึกฝนร่างกาย 30 นาที</h4>
-                            </div>
-                            <span class="text-emerald-600 bg-emerald-100 border-2 border-emerald-300 font-anime font-bold text-sm px-4 py-1.5 rounded-full flex items-center gap-1">
-                                ✔️ CLEAR!
-                            </span>
-                        </div>
-
-                    </div>
-
+                <div class="flex justify-between mt-4">
+                    <button onclick="app.deleteLogForToday('period')" class="text-sm text-red-500 font-medium px-2 py-2 hover:bg-red-50 rounded-lg">ลบข้อมูลวันนี้</button>
+                    <button onclick="app.saveLog('period')" class="bg-bloom-pink text-white px-6 py-2 rounded-xl font-semibold shadow-md">บันทึกลงฐานข้อมูล</button>
                 </div>
             </div>
         </div>
-    </main>
 
-    <!-- Scripts -->
+        <!-- Symptom Modal -->
+        <div id="symptom-modal" class="modal">
+            <div class="modal-content bg-white dark:bg-gray-800 transition-colors border dark:border-gray-700">
+                <div class="flex justify-between items-center mb-4"><h3 class="text-lg font-bold text-gray-800 dark:text-white flex items-center gap-2"><i class="fa-solid fa-notes-medical text-purple-400"></i> บันทึกอาการ</h3><button onclick="app.closeModal('symptom-modal')" class="text-gray-400 hover:text-gray-700"><i class="fa-solid fa-xmark text-xl"></i></button></div>
+                <div class="grid grid-cols-2 gap-3 mb-6" id="symptom-options">
+                    <button onclick="app.selectOption('symptom', 'ปวดท้อง', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-band-aid text-purple-400"></i> ปวดท้อง</button>
+                    <button onclick="app.selectOption('symptom', 'ปวดหัว', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-head-side-virus text-purple-400"></i> ปวดหัว</button>
+                    <button onclick="app.selectOption('symptom', 'สิวขึ้น', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-face-flushed text-purple-400"></i> สิวขึ้น</button>
+                    <button onclick="app.selectOption('symptom', 'อ่อนเพลีย', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-bed text-purple-400"></i> อ่อนเพลีย</button>
+                </div>
+                <div class="flex justify-between mt-2"><button onclick="app.deleteLogForToday('symptom')" class="text-sm text-red-500 font-medium px-2 py-2 hover:bg-red-50 rounded-lg">ลบของวันนี้</button><button onclick="app.saveLog('symptom')" class="bg-purple-500 text-white px-6 py-2 rounded-xl font-semibold">บันทึก</button></div>
+            </div>
+        </div>
+
+        <!-- Mood Modal -->
+        <div id="mood-modal" class="modal">
+            <div class="modal-content bg-white dark:bg-gray-800 transition-colors border dark:border-gray-700">
+                <div class="flex justify-between items-center mb-4"><h3 class="text-lg font-bold text-gray-800 dark:text-white flex items-center gap-2"><i class="fa-solid fa-face-smile text-yellow-400"></i> บันทึกอารมณ์</h3><button onclick="app.closeModal('mood-modal')" class="text-gray-400 hover:text-gray-700"><i class="fa-solid fa-xmark text-xl"></i></button></div>
+                <div class="grid grid-cols-2 gap-3 mb-6" id="mood-options">
+                    <button onclick="app.selectOption('mood', 'มีความสุข', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-face-grin-beam text-yellow-500"></i> มีความสุข</button>
+                    <button onclick="app.selectOption('mood', 'เศร้า', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-face-sad-tear text-blue-400"></i> เศร้า</button>
+                    <button onclick="app.selectOption('mood', 'หงุดหงิด', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-face-angry text-red-500"></i> หงุดหงิด</button>
+                    <button onclick="app.selectOption('mood', 'เซนซิทีฟ', this)" class="btn-select bg-gray-50 dark:bg-gray-700 p-3 rounded-xl flex items-center gap-2 text-gray-600 dark:text-gray-300 text-sm"><i class="fa-solid fa-face-rolling-eyes text-green-400"></i> เซนซิทีฟ</button>
+                </div>
+                <div class="flex justify-between mt-2"><button onclick="app.deleteLogForToday('mood')" class="text-sm text-red-500 font-medium px-2 py-2 hover:bg-red-50 rounded-lg">ลบของวันนี้</button><button onclick="app.saveLog('mood')" class="bg-yellow-500 text-white px-6 py-2 rounded-xl font-semibold">บันทึก</button></div>
+            </div>
+        </div>
+
+        <!-- Note Modal -->
+        <div id="note-modal" class="modal">
+            <div class="modal-content bg-white dark:bg-gray-800 transition-colors border dark:border-gray-700">
+                 <div class="flex justify-between items-center mb-4"><h3 class="text-lg font-bold text-gray-800 dark:text-white flex items-center gap-2"><i class="fa-solid fa-book-journal-whills text-blue-400"></i> ไดอารี่วันนี้</h3><button onclick="app.closeModal('note-modal')" class="text-gray-400 hover:text-gray-700"><i class="fa-solid fa-xmark text-xl"></i></button></div>
+                <textarea id="daily-note-text" rows="5" class="w-full p-4 rounded-xl border border-gray-200 dark:border-gray-700 focus:outline-none focus:border-blue-400 bg-gray-50 dark:bg-gray-700 dark:text-white mb-4 text-sm resize-none transition-colors" placeholder="วันนี้คุณรู้สึกอย่างไรบ้าง?"></textarea>
+                <div class="flex justify-between mt-2"><button onclick="app.deleteLogForToday('note')" class="text-sm text-red-500 font-medium px-2 py-2 hover:bg-red-50 rounded-lg">ลบไดอารี่</button><button onclick="app.saveNote()" class="bg-blue-500 text-white px-6 py-2 rounded-xl font-semibold">บันทึก</button></div>
+            </div>
+        </div>
+
+        <!-- BBT Modal -->
+        <div id="bbt-modal" class="modal">
+            <div class="modal-content bg-white dark:bg-gray-800 transition-colors border dark:border-gray-700">
+                 <div class="flex justify-between items-center mb-4"><h3 class="text-lg font-bold text-gray-800 dark:text-white flex items-center gap-2"><i class="fa-solid fa-temperature-half text-orange-400"></i> อุณหภูมิร่างกาย (BBT)</h3><button onclick="app.closeModal('bbt-modal')" class="text-gray-400 hover:text-gray-700"><i class="fa-solid fa-xmark text-xl"></i></button></div>
+                <p class="text-xs text-gray-500 mb-4">*วัดตอนตื่นนอนทันที ก่อนลุกจากเตียง</p>
+                <div class="flex items-center gap-3 mb-6 bg-gray-50 dark:bg-gray-700 p-3 rounded-xl border border-gray-200 dark:border-gray-600">
+                    <input type="number" id="bbt-input" step="0.01" class="w-full text-2xl font-bold bg-transparent focus:outline-none dark:text-white text-center" placeholder="36.50">
+                    <span class="text-gray-500 dark:text-gray-300 font-semibold pr-2">°C</span>
+                </div>
+                <div class="flex justify-between mt-2"><button onclick="app.deleteLogForToday('bbt')" class="text-sm text-red-500 font-medium px-2 py-2 hover:bg-red-50 rounded-lg">ลบข้อมูล</button><button onclick="app.saveNumericLog('bbt')" class="bg-orange-400 hover:bg-orange-500 text-white px-6 py-2 rounded-xl font-semibold">บันทึก</button></div>
+            </div>
+        </div>
+
+        <!-- Weight Modal -->
+        <div id="weight-modal" class="modal">
+            <div class="modal-content bg-white dark:bg-gray-800 transition-colors border dark:border-gray-700">
+                 <div class="flex justify-between items-center mb-4"><h3 class="text-lg font-bold text-gray-800 dark:text-white flex items-center gap-2"><i class="fa-solid fa-weight-scale text-teal-400"></i> น้ำหนักตัว</h3><button onclick="app.closeModal('weight-modal')" class="text-gray-400 hover:text-gray-700"><i class="fa-solid fa-xmark text-xl"></i></button></div>
+                <div class="flex items-center gap-3 mb-6 bg-gray-50 dark:bg-gray-700 p-3 rounded-xl border border-gray-200 dark:border-gray-600">
+                    <input type="number" id="weight-input" step="0.1" class="w-full text-2xl font-bold bg-transparent focus:outline-none dark:text-white text-center" placeholder="50.0">
+                    <span class="text-gray-500 dark:text-gray-300 font-semibold pr-2">kg</span>
+                </div>
+                <div class="flex justify-between mt-2"><button onclick="app.deleteLogForToday('weight')" class="text-sm text-red-500 font-medium px-2 py-2 hover:bg-red-50 rounded-lg">ลบข้อมูล</button><button onclick="app.saveNumericLog('weight')" class="bg-teal-500 hover:bg-teal-600 text-white px-6 py-2 rounded-xl font-semibold">บันทึก</button></div>
+            </div>
+        </div>
+
+        <!-- Edit Profile Modal -->
+        <div id="edit-profile-modal" class="modal">
+            <div class="modal-content bg-white dark:bg-gray-800 transition-colors border dark:border-gray-700">
+                <div class="flex justify-between items-center mb-4"><h3 class="text-lg font-bold text-gray-800 dark:text-white">แก้ไขข้อมูลส่วนตัว</h3><button onclick="app.closeModal('edit-profile-modal')" class="text-gray-400 hover:text-gray-700"><i class="fa-solid fa-xmark text-xl"></i></button></div>
+                <div class="space-y-4 mb-6">
+                    <div><label class="block text-sm font-medium mb-1 text-gray-600">ชื่อแสดงผล</label><input type="text" id="edit-name" class="w-full p-2.5 rounded-xl border border-gray-200 dark:bg-gray-700 dark:text-white"></div>
+                    <div class="flex gap-4">
+                        <div class="flex-1"><label class="block text-sm font-medium mb-1 text-gray-600">รอบเดือน (วัน)</label><input type="number" id="edit-cycle" class="w-full p-2.5 rounded-xl border border-gray-200 dark:bg-gray-700 text-center dark:text-white"></div>
+                        <div class="flex-1"><label class="block text-sm font-medium mb-1 text-gray-600">ระยะเวลามา (วัน)</label><input type="number" id="edit-duration" class="w-full p-2.5 rounded-xl border border-gray-200 dark:bg-gray-700 text-center dark:text-white"></div>
+                    </div>
+                </div>
+                <button onclick="app.saveProfile()" class="w-full bg-gray-800 dark:bg-gray-700 text-white px-6 py-3 rounded-xl font-semibold hover:bg-gray-700">อัปเดตข้อมูล</button>
+            </div>
+        </div>
+
+        <!-- Alerts & Confirms -->
+        <div id="alert-modal" class="modal" style="z-index: 110;">
+            <div class="modal-content text-center py-6 bg-white dark:bg-gray-800 border dark:border-gray-700">
+                <div id="alert-icon" class="text-4xl text-bloom-pink mb-3"><i class="fa-solid fa-circle-check"></i></div>
+                <h3 id="alert-title" class="text-lg font-bold text-gray-800 dark:text-white mb-1">สำเร็จ</h3>
+                <div id="alert-message" class="text-sm text-gray-500 dark:text-gray-400 mb-5 whitespace-pre-line text-left bg-gray-50 dark:bg-gray-700/50 p-3 rounded-lg mx-auto inline-block min-w-full">ดำเนินการเรียบร้อยแล้ว</div>
+                <button onclick="app.closeModal('alert-modal')" class="bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-white px-6 py-2 rounded-full text-sm font-semibold hover:bg-gray-200 w-full mt-2">ตกลง</button>
+            </div>
+        </div>
+        
+        <div id="confirm-modal" class="modal" style="z-index: 105;">
+            <div class="modal-content text-center py-6 bg-white dark:bg-gray-800 border dark:border-gray-700">
+                <div class="text-4xl text-red-500 mb-3"><i class="fa-solid fa-triangle-exclamation"></i></div>
+                <h3 id="confirm-title" class="text-lg font-bold text-gray-800 dark:text-white mb-1">ยืนยันการทำรายการ</h3>
+                <div id="confirm-message" class="text-sm text-gray-500 dark:text-gray-400 mb-5 whitespace-pre-line bg-gray-50 dark:bg-gray-700/50 p-3 rounded-lg mx-auto"></div>
+                <div class="flex gap-3 mt-2">
+                    <button onclick="app.closeModal('confirm-modal')" class="flex-1 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-white px-4 py-2 rounded-xl text-sm font-semibold hover:bg-gray-200">ยกเลิก</button>
+                    <button id="confirm-action-btn" class="flex-1 bg-red-500 text-white px-4 py-2 rounded-xl text-sm font-semibold hover:bg-red-600">ตกลง</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Application Logic (Refactored to fetch from PHP Backend) -->
     <script>
-        // Toggle Custom Quest Form with bouncy animation
-        function toggleCustomQuestForm() {
-            const form = document.getElementById('customQuestForm');
-            if (form.classList.contains('hidden')) {
-                form.classList.remove('hidden');
-                // Anime bounce-in effect
-                form.animate([
-                    { opacity: 0, transform: 'scale(0.8) translateY(-20px)' },
-                    { opacity: 1, transform: 'scale(1.05) translateY(5px)' },
-                    { opacity: 1, transform: 'scale(1) translateY(0)' }
-                ], { duration: 400, easing: 'cubic-bezier(0.34, 1.56, 0.64, 1)' });
-            } else {
-                form.animate([
-                    { opacity: 1, transform: 'scale(1)' },
-                    { opacity: 0, transform: 'scale(0.9) translateY(-10px)' }
-                ], { duration: 200, easing: 'ease-in' }).onfinish = () => {
-                    form.classList.add('hidden');
-                };
-            }
-        }
+        // รับตัวแปรจากฝั่ง Server ว่าตอนนี้ Login อยู่หรือไม่
+        const SERVER_USER = <?php echo isset($_SESSION['user']) ? json_encode($_SESSION['user']) : 'null'; ?>;
 
-        // Handle Quest Submission
-        function handleQuestSubmit(event) {
-            event.preventDefault();
-            const input = event.target.querySelector('input');
-            showDialogue(`ได้รับเควสต์เสริม: "${input.value}" เริ่มลุยได้เลย! 🚀`, 'bg-anime-blue', 'text-white');
-            
-            toggleCustomQuestForm();
-            event.target.reset();
-        }
+        const app = {
+            db: { logs: [] },
+            currentUser: null, 
+            activeTab: 'dashboard', currentDate: new Date(), displayMonth: new Date(),
+            selectedTemp: { period_flow: null, period_status: null, symptom: null, mood: null },
+            chartInstance: null, theme: 'light',
+            pinConfig: { mode: 'unlock', input: '', tempPin: '', onSuccess: null },
+            alertsShown: { missedPeriod: false },
 
-        // Complete Quest with Action Animation
-        function completeQuest(buttonElement) {
-            const questCard = buttonElement.closest('.quest-card');
+            async init() {
+                this.loadTheme();
+                
+                if (SERVER_USER) {
+                    this.currentUser = SERVER_USER;
+                    if (this.currentUser.pin && this.currentUser.role !== 'admin') { 
+                        this.showPinPad('unlock', () => { this.handleLoginSuccess(this.currentUser, true); }); 
+                    } 
+                    else { this.handleLoginSuccess(this.currentUser); } 
+                    return;
+                }
+            },
             
-            // Action Button Change
-            buttonElement.innerHTML = `🌟 กำลังรับรางวัล...`;
-            buttonElement.className = "cartoon-btn bg-yellow-400 text-anime-outline text-base px-4 py-2.5 pointer-events-none";
-            
-            setTimeout(() => {
-                const title = questCard.querySelector('h4').innerText;
-                
-                showDialogue(`เคลียร์ภารกิจ "${title}" สำเร็จ! ได้รับ XP แล้ว 🎉`, 'bg-emerald-300', 'text-anime-outline');
-                
-                // Explode/Fade out animation for card
-                questCard.animate([
-                    { transform: 'scale(1)', opacity: 1 },
-                    { transform: 'scale(1.05) rotate(2deg)', opacity: 0.8 },
-                    { transform: 'scale(0.8) rotate(-5deg)', opacity: 0 }
-                ], { duration: 400, easing: 'ease-out' }).onfinish = () => {
-                    questCard.remove();
-                };
-                
-            }, 600);
-        }
+            // Helper: HTTP Request
+            async apiCall(action, payload) {
+                try {
+                    const res = await fetch(`?api=${action}`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    return await res.json();
+                } catch(e) {
+                    console.error("API Error:", e); return {success: false, msg: 'การเชื่อมต่อขัดข้อง'};
+                }
+            },
 
-        // Custom Anime Dialogue notification
-        function showDialogue(text, bgColor = 'bg-white', textColor = 'text-anime-outline') {
-            const flash = document.getElementById('flash-msg');
-            const flashText = document.getElementById('flash-text');
+            loadTheme() {
+                const savedTheme = localStorage.getItem('bloom_theme');
+                if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                    this.theme = 'dark'; document.documentElement.classList.add('dark'); document.getElementById('theme-toggle').checked = true;
+                }
+            },
+            toggleTheme() {
+                if (this.theme === 'light') { this.theme = 'dark'; document.documentElement.classList.add('dark'); localStorage.setItem('bloom_theme', 'dark'); } 
+                else { this.theme = 'light'; document.documentElement.classList.remove('dark'); localStorage.setItem('bloom_theme', 'light'); }
+                if (this.activeTab === 'stats') this.renderStats();
+            },
             
-            // Reset classes
-            flash.className = `dialogue-box p-4 mb-8 flex items-center gap-4 max-w-2xl shadow-[4px_4px_0_0_#1e1b4b] ${bgColor}`;
-            flashText.className = `font-medium text-lg font-anime ${textColor}`;
+            formatDate(dateObj) { const offset = dateObj.getTimezoneOffset() * 60000; return (new Date(dateObj - offset)).toISOString().split('T')[0]; },
+            getTodayStr() { return this.formatDate(new Date()); },
             
-            flashText.innerText = text;
-            flash.classList.remove('hidden');
+            showAlert(title, msg, type = 'success') {
+                document.getElementById('alert-title').innerText = title; document.getElementById('alert-message').innerText = msg;
+                const icon = document.getElementById('alert-icon');
+                if(type === 'success') icon.innerHTML = '<i class="fa-solid fa-circle-check text-green-500"></i>';
+                else if(type === 'error') icon.innerHTML = '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
+                else if(type === 'warning') icon.innerHTML = '<i class="fa-solid fa-triangle-exclamation text-yellow-500"></i>';
+                else icon.innerHTML = '<i class="fa-solid fa-circle-info text-blue-500"></i>';
+                this.openModal('alert-modal');
+            },
+            showConfirm(title, msg, onConfirm) {
+                document.getElementById('confirm-title').innerText = title; document.getElementById('confirm-message').innerText = msg;
+                document.getElementById('confirm-action-btn').onclick = () => { this.closeModal('confirm-modal'); onConfirm(); };
+                this.openModal('confirm-modal');
+            },
+
+            // PIN Setup 
+            showPinPad(mode, onSuccessCallback = null) { this.pinConfig = { mode, input: '', tempPin: '', onSuccess: onSuccessCallback }; this.updatePinUI(); document.getElementById('pin-view').classList.remove('hidden'); document.getElementById('pin-view').classList.add('flex'); const btn = document.getElementById('pin-cancel-btn'); btn.classList.add('hidden'); if(mode === 'unlock') { document.getElementById('pin-title').innerText = 'กรอกรหัส PIN'; document.getElementById('pin-subtitle').innerText = 'เพื่อเข้าใช้งาน'; } else if (mode === 'setup_1') { document.getElementById('pin-title').innerText = 'ตั้งรหัส PIN ใหม่'; btn.classList.remove('hidden'); } else if (mode === 'remove') { document.getElementById('pin-title').innerText = 'ปิดการใช้งาน PIN'; btn.classList.remove('hidden'); } },
+            hidePinPad() { document.getElementById('pin-view').classList.add('hidden'); document.getElementById('pin-view').classList.remove('flex'); },
+            cancelPinAction() { this.hidePinPad(); },
+            pressPin(num) { if(this.pinConfig.input.length < 4) { this.pinConfig.input += num; this.updatePinUI(); if(this.pinConfig.input.length === 4) setTimeout(() => this.processPinComplete(), 200); } },
+            deletePin() { if(this.pinConfig.input.length > 0) { this.pinConfig.input = this.pinConfig.input.slice(0, -1); this.updatePinUI(); } },
+            updatePinUI() { const dots = document.querySelectorAll('.pin-dot'); for(let i=0; i<4; i++) { if(i < this.pinConfig.input.length) { dots[i].classList.add('bg-bloom-pink'); dots[i].classList.remove('bg-transparent'); } else { dots[i].classList.remove('bg-bloom-pink'); dots[i].classList.add('bg-transparent'); } } },
+            pinErrorAnim() { const dc = document.getElementById('pin-indicators'); dc.classList.add('shake-animation'); setTimeout(() => { dc.classList.remove('shake-animation'); this.pinConfig.input = ''; this.updatePinUI(); }, 300); },
+            async processPinComplete() { 
+                const input = this.pinConfig.input; 
+                if (this.pinConfig.mode === 'unlock' || this.pinConfig.mode === 'remove') { 
+                    if (input === this.currentUser.pin) { 
+                        this.hidePinPad(); 
+                        if(this.pinConfig.mode === 'unlock' && this.pinConfig.onSuccess) { this.pinConfig.onSuccess(); }
+                        else if (this.pinConfig.mode === 'remove') { 
+                            this.currentUser.pin = null; 
+                            await this.apiCall('update_pin', {pin: null});
+                            this.renderProfile(); this.showAlert('สำเร็จ', 'ปิดใช้งานรหัสผ่าน PIN เรียบร้อยแล้ว'); 
+                        } 
+                    } else this.pinErrorAnim(); 
+                } else if (this.pinConfig.mode === 'setup_1') { 
+                    this.pinConfig.tempPin = input; this.pinConfig.mode = 'setup_2'; this.pinConfig.input = ''; this.updatePinUI(); document.getElementById('pin-title').innerText = 'ยืนยันรหัส PIN'; 
+                } else if (this.pinConfig.mode === 'setup_2') { 
+                    if (input === this.pinConfig.tempPin) { 
+                        this.currentUser.pin = input; 
+                        await this.apiCall('update_pin', {pin: input});
+                        this.hidePinPad(); this.renderProfile(); this.showAlert('สำเร็จ', 'ตั้งค่ารหัสผ่าน PIN เรียบร้อยแล้ว'); 
+                    } else { 
+                        this.pinErrorAnim(); this.pinConfig.mode = 'setup_1'; setTimeout(() => { document.getElementById('pin-title').innerText = 'ตั้งรหัส PIN ใหม่'; }, 1000); 
+                    } 
+                } 
+            },
+            startPinSetupFlow() { if (this.currentUser.pin) this.showPinPad('remove'); else this.showPinPad('setup_1'); },
+
+            // Auth Logic (PHP Integrated)
+            toggleAuth() { const l = document.getElementById('login-form'); const r = document.getElementById('register-form'); if (l.classList.contains('hidden')) { l.classList.remove('hidden'); r.classList.add('hidden'); } else { l.classList.add('hidden'); r.classList.remove('hidden'); } },
             
-            // Pop in
-            flash.animate([
-                { opacity: 0, transform: 'translateX(-50px) scale(0.9)' },
-                { opacity: 1, transform: 'translateX(0) scale(1)' }
-            ], { duration: 300, easing: 'cubic-bezier(0.175, 0.885, 0.32, 1.275)' });
+            async login() { 
+                const u = document.getElementById('login-user').value.trim(); 
+                const p = document.getElementById('login-pass').value.trim(); 
+                if(!u || !p) return this.showAlert('ข้อผิดพลาด', 'กรุณากรอกข้อมูลให้ครบถ้วน', 'error'); 
+                
+                const data = await this.apiCall('login', {username: u, password: p});
+                if (data.success) { 
+                    this.currentUser = data.user;
+                    if (this.currentUser.pin && this.currentUser.role !== 'admin') { 
+                        this.showPinPad('unlock', () => { this.handleLoginSuccess(this.currentUser, true); }); 
+                    } else {
+                        this.handleLoginSuccess(this.currentUser, false); 
+                    }
+                } else {
+                    this.showAlert('ล้มเหลว', data.msg, 'error'); 
+                } 
+            },
             
-            setTimeout(() => {
-                flash.animate([
-                    { opacity: 1, transform: 'translateY(0)' },
-                    { opacity: 0, transform: 'translateY(-20px)' }
-                ], { duration: 300, easing: 'ease-in' }).onfinish = () => {
-                    flash.classList.add('hidden');
+            async handleLoginSuccess(user, skipPin = false) { 
+                this.currentUser = user; 
+                
+                const avatarUrl = user.avatar || `https://api.dicebear.com/7.x/notionists/svg?seed=${user.username}`;
+                document.querySelectorAll('img[alt="avatar"]').forEach(img => img.src = avatarUrl); 
+                
+                document.getElementById('auth-view').classList.remove('active'); 
+                if (user.role === 'admin') { 
+                    document.getElementById('admin-view').classList.add('active'); this.renderAdmin(); 
+                } else {
+                    // Fetch logs from DB
+                    const data = await this.apiCall('get_logs', {});
+                    if(data.success) { this.db.logs = data.logs; }
+                    
+                    document.getElementById('main-view').classList.remove('hidden'); document.getElementById('main-view').classList.add('flex'); this.switchTab('dashboard'); 
+                } 
+            },
+            
+            async register() { 
+                const name = document.getElementById('reg-name').value; const u = document.getElementById('reg-user').value; const p = document.getElementById('reg-pass').value; const cycle = parseInt(document.getElementById('reg-cycle').value); const dur = parseInt(document.getElementById('reg-duration').value); 
+                if(!name || !u || !p || !cycle || !dur) return this.showAlert('ผิดพลาด', 'กรอกข้อมูลให้ครบถ้วน', 'error'); 
+                
+                const data = await this.apiCall('register', {username: u, password: p, name: name, cycle: cycle, duration: dur});
+                if(data.success) {
+                    this.showAlert('สำเร็จ', 'สมัครสมาชิกเรียบร้อย', 'success'); this.toggleAuth(); 
+                } else {
+                    this.showAlert('ผิดพลาด', data.msg, 'error');
+                }
+            },
+            
+            async logout() { 
+                await this.apiCall('logout', {});
+                this.currentUser = null; this.db.logs = [];
+                document.getElementById('main-view').classList.add('hidden'); document.getElementById('main-view').classList.remove('flex'); document.getElementById('admin-view').classList.remove('active'); document.getElementById('auth-view').classList.add('active'); 
+                // Clear input fields
+                document.getElementById('login-pass').value = '';
+            },
+
+            async handleAvatarUpload(event) {
+                const file = event.target.files[0];
+                if (!file) return;
+                if (file.size > 2 * 1024 * 1024) return this.showAlert('ไฟล์ใหญ่เกินไป', 'กรุณาอัปโหลดรูปภาพที่มีขนาดไม่เกิน 2MB', 'error');
+
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    const base64Image = e.target.result;
+                    this.currentUser.avatar = base64Image;
+                    
+                    document.querySelectorAll('img[alt="avatar"]').forEach(img => img.src = base64Image);
+                    
+                    // Save to DB
+                    await this.apiCall('update_profile', {
+                        name: this.currentUser.name, cycle: this.currentUser.cycle, duration: this.currentUser.duration, avatar: base64Image
+                    });
+                    
+                    this.showAlert('สำเร็จ', 'เปลี่ยนรูปภาพโปรไฟล์เรียบร้อยแล้ว', 'success');
                 };
-            }, 4000);
-        }
+                reader.readAsDataURL(file);
+            },
+
+            // Navigation
+            switchTab(tabId) { this.activeTab = tabId; document.querySelectorAll('.nav-btn').forEach(btn => { if (btn.dataset.tab === tabId) btn.classList.add('active'); else btn.classList.remove('active'); }); document.querySelectorAll('#main-view .view-section').forEach(view => { view.classList.remove('active'); }); document.getElementById(`tab-${tabId}`).classList.add('active'); if (tabId === 'dashboard') this.renderDashboard(); if (tabId === 'calendar') this.renderCalendar(); if (tabId === 'stats') this.renderStats(); if (tabId === 'profile') this.renderProfile(); },
+
+            // Log Logic (Refactored for DB)
+            async saveLog(type) {
+                const todayStr = this.getTodayStr();
+                if (type === 'period') {
+                    const flow = this.selectedTemp['period_flow']; const status = this.selectedTemp['period_status'];
+                    if (!flow) return this.showAlert('แจ้งเตือน', 'กรุณาเลือกระดับปริมาณเลือด', 'info');
+                    
+                    // Optimistic Local Update
+                    this.db.logs = this.db.logs.filter(l => !(l.date === todayStr && (l.type === 'period' || l.type === 'period_status')));
+                    this.db.logs.push({ type: 'period', value: flow, date: todayStr });
+                    if (status) this.db.logs.push({ type: 'period_status', value: status, date: todayStr });
+                    
+                    this.closeModal('period-modal'); this.showAlert('บันทึกสำเร็จ', 'ข้อมูลถูกบันทึกเรียบร้อยแล้ว', 'success');
+                    if (this.activeTab === 'dashboard') this.renderDashboard();
+                    
+                    // DB Update
+                    await this.apiCall('save_log', {type: 'period', value: flow, date: todayStr});
+                    if (status) await this.apiCall('save_log', {type: 'period_status', value: status, date: todayStr});
+                    return;
+                }
+                
+                const val = this.selectedTemp[type]; if (!val && type !== 'water' && type !== 'pill') return this.showAlert('แจ้งเตือน', 'กรุณาเลือกข้อมูล', 'info');
+                
+                if (type !== 'water' && type !== 'pill') {
+                    const existing = this.db.logs.find(l => l.date === todayStr && l.type === type && l.value === val);
+                    if(!existing) this.db.logs.push({ type: type, value: val, date: todayStr });
+                } else if (type === 'water') { 
+                    this.db.logs.push({ type: type, value: '1', date: todayStr }); 
+                }
+                
+                this.closeModal(`${type}-modal`); if(type !== 'water' && type !== 'pill') this.showAlert('บันทึกสำเร็จ', 'ข้อมูลถูกบันทึกลงฐานข้อมูลเรียบร้อย', 'success');
+                if (this.activeTab === 'dashboard') this.renderDashboard();
+                
+                // DB Update
+                await this.apiCall('save_log', {type: type, value: val || '1', date: todayStr});
+            },
+            
+            async saveNumericLog(type) {
+                const inputEl = document.getElementById(`${type}-input`);
+                const val = inputEl.value.trim();
+                if(!val) return this.showAlert('แจ้งเตือน', 'กรุณากรอกตัวเลขก่อนบันทึก', 'warning');
+                
+                const todayStr = this.getTodayStr();
+                this.db.logs = this.db.logs.filter(l => !(l.date === todayStr && l.type === type));
+                this.db.logs.push({ type: type, value: val, date: todayStr });
+                
+                this.closeModal(`${type}-modal`);
+                this.showAlert('บันทึกสำเร็จ', 'อัปเดตข้อมูลเรียบร้อยแล้ว', 'success');
+                if (this.activeTab === 'dashboard') this.renderDashboard();
+                
+                // DB Update
+                await this.apiCall('save_log', {type: type, value: val, date: todayStr});
+            },
+
+            async deleteLogForToday(type) {
+                const todayStr = this.getTodayStr();
+                if (type === 'period') { this.db.logs = this.db.logs.filter(l => !(l.date === todayStr && (l.type === 'period' || l.type === 'period_status'))); } 
+                else { this.db.logs = this.db.logs.filter(l => !(l.date === todayStr && l.type === type)); }
+                
+                this.closeModal(`${type}-modal`); this.showAlert('สำเร็จ', 'ลบข้อมูลของวันนี้เรียบร้อยแล้ว', 'success');
+                if (this.activeTab === 'dashboard') this.renderDashboard();
+                
+                // DB Update
+                await this.apiCall('delete_log', {type: type, date: todayStr});
+            },
+            
+            async togglePill() { 
+                const todayStr = this.getTodayStr(); const ex = this.db.logs.find(l => l.date === todayStr && l.type === 'pill'); 
+                if (ex) {
+                    this.db.logs = this.db.logs.filter(l => !(l.date === todayStr && l.type === 'pill'));
+                    await this.apiCall('delete_log', {type: 'pill', date: todayStr});
+                } else {
+                    this.db.logs.push({ type: 'pill', value: '1', date: todayStr }); 
+                    await this.apiCall('save_log', {type: 'pill', value: '1', date: todayStr});
+                }
+                this.renderDashboard(); 
+            },
+            
+            async saveNote() { 
+                const text = document.getElementById('daily-note-text').value.trim(); if(!text) return this.showAlert('แจ้งเตือน', 'กรุณาพิมพ์ข้อความ', 'info'); 
+                const todayStr = this.getTodayStr(); 
+                this.db.logs = this.db.logs.filter(l => !(l.date === todayStr && l.type === 'note')); 
+                this.db.logs.push({ type: 'note', value: text, date: todayStr }); 
+                this.closeModal('note-modal'); this.showAlert('สำเร็จ', 'บันทึกไดอารี่เรียบร้อย', 'success'); this.renderDashboard(); 
+                
+                await this.apiCall('save_log', {type: 'note', value: text, date: todayStr});
+            },
+            
+            async toggleWater(index) { 
+                const todayStr = this.getTodayStr(); const waterLogs = this.db.logs.filter(l => l.date === todayStr && l.type === 'water'); 
+                if (index < waterLogs.length) { 
+                    // Remove last water drop locally
+                    let removed = false;
+                    this.db.logs = this.db.logs.filter(l => {
+                        if(l.date === todayStr && l.type === 'water' && !removed) { removed = true; return false; }
+                        return true;
+                    });
+                    this.renderDashboard();
+                    await this.apiCall('delete_log', {type: 'water', date: todayStr});
+                } else if (index === waterLogs.length) { 
+                    this.saveLog('water'); 
+                } 
+            },
+
+            // Alerts functions
+            checkAbnormalAlert() {
+                const abnormalLogs = this.db.logs.filter(l => l.type === 'period_status' && l.value === 'abnormal');
+                if (abnormalLogs.length >= 2) { setTimeout(() => { this.showAlert('คำแนะนำจาก Bloom 🌸', 'ระบบพบว่าคุณมีบันทึกประจำเดือนลักษณะผิดปกติหรือมีลิ่มเลือดติดต่อกันหลายครั้ง แนะนำให้จดบันทึกไว้ และปรึกษาแพทย์เฉพาะทางเพื่อความมั่นใจนะคะ', 'warning'); }, 1500); }
+            },
+            checkHeavyFlowAlert() {
+                const today = new Date(); today.setHours(0,0,0,0);
+                const past7Days = new Date(today); past7Days.setDate(today.getDate() - 7);
+                const heavyLogs = this.db.logs.filter(l => l.type === 'period' && l.value === 'heavy' && new Date(l.date) >= past7Days);
+                if (heavyLogs.length >= 3) { setTimeout(() => { this.showAlert('ข้อควรระวังเรื่องสุขภาพ 🩺', 'ระบบพบว่าคุณมีประจำเดือน "มามาก" ติดต่อกันหลายวัน ซึ่งอาจทำให้ร่างกายสูญเสียเลือดมากจนเกิดภาวะโลหิตจาง (ซีด) หรืออ่อนเพลียได้\n\nหากต้องเปลี่ยนผ้าอนามัยชุ่มเลือดทุก 1-2 ชั่วโมง แนะนำให้ไปพบสูตินรีแพทย์เพื่อตรวจเช็คนะคะ', 'warning'); }, 1500); }
+            },
+            checkMissedPeriodAlert() {
+                if (this.alertsShown && this.alertsShown.missedPeriod) return;
+                const periodLogs = this.db.logs.filter(l => l.type === 'period').sort((a,b) => new Date(a.date) - new Date(b.date));
+                if (periodLogs.length === 0) return;
+                let lastPeriodDate = new Date(periodLogs[periodLogs.length - 1].date); lastPeriodDate.setHours(0,0,0,0);
+                const today = new Date(); today.setHours(0,0,0,0);
+                const diffTime = Math.abs(today - lastPeriodDate); const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                if (diffDays >= 45) {
+                    if (!this.alertsShown) this.alertsShown = {};
+                    this.alertsShown.missedPeriod = true;
+                    setTimeout(() => { this.showAlert('ประจำเดือนขาดหาย 🔔', `ประจำเดือนของคุณไม่ได้มาประมาณ ${diffDays} วัน (เกิน 1-2 เดือนแล้ว)\n\nสาเหตุอาจเกิดจากความเครียด พักผ่อนน้อย ฮอร์โมนเปลี่ยนแปลง หรือการตั้งครรภ์ แนะนำให้ลองซื้อที่ตรวจครรภ์เบื้องต้น หรือปรึกษาแพทย์เพื่อความสบายใจนะคะ`, 'warning'); }, 1500);
+                }
+            },
+
+            // Cycle Calculations
+            getCycleInfo() {
+                const periodLogs = this.db.logs.filter(l => l.type === 'period').sort((a,b) => new Date(a.date) - new Date(b.date));
+                const today = new Date(); today.setHours(0,0,0,0);
+                if (periodLogs.length === 0) return { day: 1, phase: 'unknown', nextPeriod: this.currentUser.cycle };
+                let lastCycleStartDate = new Date(periodLogs[periodLogs.length - 1].date);
+                for(let i = periodLogs.length - 2; i >= 0; i--) { let prevDate = new Date(periodLogs[i].date); let currDate = new Date(periodLogs[i+1].date); if((currDate - prevDate) / (1000*60*60*24) > 10) break; lastCycleStartDate = prevDate; }
+                lastCycleStartDate.setHours(0,0,0,0);
+                const diffTime = Math.abs(today - lastCycleStartDate); const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+                let cycleDay = (diffDays % this.currentUser.cycle) + 1; let nextPeriodDays = this.currentUser.cycle - cycleDay + 1;
+                if (diffDays > this.currentUser.cycle) nextPeriodDays = 0;
+                let phase = ''; if (cycleDay <= this.currentUser.duration) phase = 'menstruation'; else if (cycleDay < 14) phase = 'follicular'; else if (cycleDay >= 14 && cycleDay <= 16) phase = 'ovulation'; else phase = 'luteal';
+                return { day: diffDays + 1, phase: phase, nextPeriod: nextPeriodDays, lastPeriodDate: lastCycleStartDate };
+            },
+
+            // Render Views
+            renderDashboard() {
+                const hour = new Date().getHours(); let greet = 'สวัสดี';
+                if(hour < 12) greet = 'อรุณสวัสดิ์ ☀️'; else if(hour < 18) greet = 'สวัสดีตอนบ่าย ⛅'; else greet = 'สวัสดีตอนค่ำ 🌙';
+                document.getElementById('greeting-text').innerText = greet; document.getElementById('user-name-display').innerText = this.currentUser.name;
+
+                const cycleInfo = this.getCycleInfo(); document.getElementById('cycle-day-number').innerText = cycleInfo.day;
+                const ring = document.getElementById('cycle-ring'); const circumference = 251.2;
+                let percent = (cycleInfo.day / this.currentUser.cycle); if (percent > 1) percent = 1;
+                ring.style.strokeDashoffset = circumference - (percent * circumference);
+
+                const badge = document.getElementById('cycle-status-badge'); const insightText = document.getElementById('daily-insight-text'); const predText = document.getElementById('prediction-text');
+                ring.className = 'stroke-current progress-ring__circle';
+                
+                if (cycleInfo.phase === 'menstruation') { badge.innerText = 'ช่วงมีประจำเดือน'; badge.className = 'inline-block px-4 py-1.5 rounded-full bg-red-100 dark:bg-red-900/40 text-red-500 font-semibold text-sm shadow-sm transition-colors'; insightText.innerText = 'พักผ่อนให้เพียงพอ ประคบอุ่นที่หน้าท้องนะคะ'; ring.classList.add('text-red-400'); } 
+                else if (cycleInfo.phase === 'follicular') { badge.innerText = 'ช่วงฟอลลิคูลาร์'; badge.className = 'inline-block px-4 py-1.5 rounded-full bg-green-100 dark:bg-green-900/40 text-green-600 font-semibold text-sm shadow-sm transition-colors'; insightText.innerText = 'พลังงานล้นเหลือ เหมาะกับการออกกำลังกายค่ะ'; ring.classList.add('text-green-400'); } 
+                else if (cycleInfo.phase === 'ovulation') { badge.innerText = 'โอกาสตั้งครรภ์สูง'; badge.className = 'inline-block px-4 py-1.5 rounded-full bg-yellow-100 dark:bg-yellow-900/40 text-yellow-600 font-semibold text-sm shadow-sm transition-colors'; insightText.innerText = 'ช่วงไข่ตก อารมณ์แจ่มใส ร่างกายมีเสน่ห์ที่สุด'; ring.classList.add('text-yellow-400'); } 
+                else { badge.innerText = 'โอกาสตั้งครรภ์ต่ำ'; badge.className = 'inline-block px-4 py-1.5 rounded-full bg-purple-100 dark:bg-purple-900/40 text-purple-600 font-semibold text-sm shadow-sm transition-colors'; insightText.innerText = 'เข้าสู่ช่วงลูเตียล ระวังเรื่องอารมณ์หงุดหงิดง่ายนะคะ'; ring.classList.add('text-purple-400'); }
+                
+                if(cycleInfo.phase === 'unknown') { ring.classList.add('text-gray-300', 'dark:text-gray-600'); insightText.innerText = 'ยินดีต้อนรับ! บันทึกข้อมูลเพื่อให้ระบบวิเคราะห์นะคะ'; badge.innerText = 'ยังไม่มีข้อมูล'; predText.innerText = ''; } 
+                else predText.innerText = cycleInfo.nextPeriod === 0 ? 'ประจำเดือนมาช้ากว่าคาดการณ์' : `คาดว่าประจำเดือนจะมาในอีก ${cycleInfo.nextPeriod} วัน`;
+
+                // Weekly Calendar
+                const today = new Date(); const weekContainer = document.getElementById('weekly-calendar'); weekContainer.innerHTML = '';
+                const fullMonthsTh = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+                document.getElementById('current-month-text').innerText = `${fullMonthsTh[today.getMonth()]} ${today.getFullYear()}`;
+
+                for (let i = -3; i <= 3; i++) {
+                    let d = new Date(today); d.setDate(today.getDate() + i); let dStr = this.formatDate(d); let isToday = i === 0;
+                    let dayLogs = this.db.logs.filter(l => l.date === dStr);
+                    let hasPeriod = dayLogs.some(l => l.type === 'period'); let hasOther = dayLogs.some(l => ['symptom', 'mood', 'note', 'bbt', 'weight'].includes(l.type));
+                    let hasPill = dayLogs.some(l => l.type === 'pill');
+                    let dotHtml = ''; if (hasPeriod) dotHtml = '<div class="w-1.5 h-1.5 rounded-full bg-bloom-pink mx-auto mt-1"></div>'; else if (hasPill) dotHtml = '<div class="w-1.5 h-1.5 rounded-full bg-green-400 mx-auto mt-1"></div>'; else if (hasOther) dotHtml = '<div class="w-1.5 h-1.5 rounded-full bg-purple-400 mx-auto mt-1"></div>'; else dotHtml = '<div class="w-1.5 h-1.5 rounded-full bg-transparent mx-auto mt-1"></div>';
+                    let dayNames = ['อา','จ','อ','พ','พฤ','ศ','ส'];
+                    let bgClass = isToday ? 'bg-bloom-pink text-white shadow-md' : 'bg-transparent text-gray-600 dark:text-gray-300';
+                    weekContainer.innerHTML += `<div class="flex flex-col items-center p-2 rounded-xl ${bgClass} w-10 transition-colors"><span class="text-[10px] mb-1 opacity-80">${dayNames[d.getDay()]}</span><span class="text-sm ${isToday ? 'font-bold' : ''}">${d.getDate()}</span>${dotHtml}</div>`;
+                }
+
+                // Water
+                const waterLogs = this.db.logs.filter(l => l.date === this.getTodayStr() && l.type === 'water');
+                const waterCount = Math.min(waterLogs.length, 8); document.getElementById('water-count-text').innerText = `${waterCount} / 8`;
+                const waterContainer = document.getElementById('water-tracker-container'); waterContainer.innerHTML = '';
+                for(let i=0; i<8; i++) { let activeClass = i < waterCount ? 'active text-blue-400' : 'text-gray-200 dark:text-gray-700'; waterContainer.innerHTML += `<div onclick="app.toggleWater(${i})" class="water-drop text-2xl ${activeClass} px-1"><i class="fa-solid fa-droplet"></i></div>`; }
+
+                // Quick Logs Badges
+                const todayStr = this.getTodayStr(); const todayLogs = this.db.logs.filter(l => l.date === todayStr);
+                
+                const btnPill = document.getElementById('btn-pill'); const badgePill = document.getElementById('pill-badge');
+                if(todayLogs.some(l => l.type === 'pill')) { btnPill.classList.add('active'); btnPill.classList.replace('border-transparent', 'border-green-400'); badgePill.classList.remove('hidden'); } else { btnPill.classList.remove('active'); btnPill.classList.replace('border-green-400', 'border-transparent'); badgePill.classList.add('hidden'); }
+
+                const noteLog = todayLogs.find(l => l.type === 'note'); const badgeNote = document.getElementById('note-badge'); const btnNote = document.getElementById('btn-note');
+                if(noteLog) { document.getElementById('daily-note-text').value = noteLog.value; badgeNote.classList.remove('hidden'); btnNote.classList.replace('border-transparent', 'border-blue-300'); } else { document.getElementById('daily-note-text').value = ''; badgeNote.classList.add('hidden'); btnNote.classList.replace('border-blue-300', 'border-transparent'); }
+                
+                const btnSymp = document.getElementById('btn-symptom'); if(todayLogs.some(l => l.type === 'symptom')) btnSymp.classList.replace('border-transparent', 'border-purple-300'); else btnSymp.classList.replace('border-purple-300', 'border-transparent');
+                const btnMood = document.getElementById('btn-mood'); if(todayLogs.some(l => l.type === 'mood')) btnMood.classList.replace('border-transparent', 'border-yellow-300'); else btnMood.classList.replace('border-yellow-300', 'border-transparent');
+                
+                const bbtLog = todayLogs.find(l => l.type === 'bbt'); const badgeBbt = document.getElementById('bbt-badge'); const btnBbt = document.getElementById('btn-bbt');
+                if(bbtLog) { document.getElementById('bbt-input').value = bbtLog.value; badgeBbt.classList.remove('hidden'); btnBbt.classList.replace('border-transparent', 'border-orange-300'); } else { document.getElementById('bbt-input').value = ''; badgeBbt.classList.add('hidden'); btnBbt.classList.replace('border-orange-300', 'border-transparent'); }
+                
+                const weightLog = todayLogs.find(l => l.type === 'weight'); const badgeWeight = document.getElementById('weight-badge'); const btnWeight = document.getElementById('btn-weight');
+                if(weightLog) { document.getElementById('weight-input').value = weightLog.value; badgeWeight.classList.remove('hidden'); btnWeight.classList.replace('border-transparent', 'border-teal-300'); } else { document.getElementById('weight-input').value = ''; badgeWeight.classList.add('hidden'); btnWeight.classList.replace('border-teal-300', 'border-transparent'); }
+
+                this.checkMissedPeriodAlert();
+            },
+
+            renderCalendar() {
+                const year = this.displayMonth.getFullYear(); const month = this.displayMonth.getMonth();
+                const fullMonthsTh = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+                document.getElementById('calendar-month-year').innerText = `${fullMonthsTh[month]} ${year}`;
+                const firstDay = new Date(year, month, 1).getDay(); const daysInMonth = new Date(year, month + 1, 0).getDate();
+                const grid = document.getElementById('full-calendar-grid'); grid.innerHTML = '';
+                for (let i = 0; i < firstDay; i++) grid.innerHTML += `<div></div>`;
+
+                const userLogs = this.db.logs; const todayStr = this.getTodayStr();
+
+                for (let i = 1; i <= daysInMonth; i++) {
+                    const d = new Date(year, month, i); const dStr = this.formatDate(d); const isToday = dStr === todayStr;
+                    const dayLogs = userLogs.filter(l => l.date === dStr);
+                    const hasPeriod = dayLogs.some(l => l.type === 'period');
+                    const hasOther = dayLogs.some(l => ['symptom', 'mood', 'note', 'pill', 'bbt', 'weight'].includes(l.type));
+                    
+                    let isPredicted = false; let isOvulation = false; const cycleInfo = this.getCycleInfo();
+                    if (cycleInfo.lastPeriodDate && d > new Date()) { const daysDiff = Math.floor((d - cycleInfo.lastPeriodDate) / (1000 * 60 * 60 * 24)); const cycleDay = (daysDiff % this.currentUser.cycle) + 1; if (cycleDay <= this.currentUser.duration) isPredicted = true; if (cycleDay === 14) isOvulation = true; }
+                    let contentHtml = `<span class="${isToday ? 'font-bold underline decoration-bloom-pink decoration-2' : ''}">${i}</span>`;
+                    let markersHtml = ''; let bgClass = 'bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'; let borderClass = 'border border-transparent';
+                    if (hasPeriod) { bgClass = 'bg-bloom-light dark:bg-pink-900/30 text-bloom-pink font-bold shadow-sm'; if(dayLogs.some(l => l.type === 'period_status' && l.value === 'abnormal')) { bgClass = 'bg-red-50 dark:bg-red-900/20 text-red-500 font-bold shadow-sm'; markersHtml += `<div class="w-1.5 h-1.5 rounded-full bg-red-400"></div>`; } else { markersHtml += `<div class="w-1.5 h-1.5 rounded-full bg-bloom-pink"></div>`; } } 
+                    else if (isPredicted) { borderClass = 'border-2 border-dashed border-bloom-pink border-opacity-40 text-gray-500'; }
+                    if (isOvulation) markersHtml += `<div class="text-yellow-400 text-[10px]"><i class="fa-solid fa-star"></i></div>`;
+                    if (hasOther && !hasPeriod) markersHtml += `<div class="w-1.5 h-1.5 rounded-full bg-purple-400"></div>`;
+                    grid.innerHTML += `<div class="h-10 rounded-lg ${bgClass} ${borderClass} flex flex-col items-center justify-center relative cursor-pointer transition-colors" onclick="app.showDateInfo('${dStr}')">${contentHtml}<div class="absolute bottom-1 flex gap-0.5 items-center justify-center w-full">${markersHtml}</div></div>`;
+                }
+            },
+            changeMonth(delta) { this.displayMonth.setMonth(this.displayMonth.getMonth() + delta); this.renderCalendar(); },
+            showDateInfo(dateStr) {
+                const dayLogs = this.db.logs.filter(l => l.date === dateStr);
+                if (dayLogs.length === 0) return;
+                const dObj = new Date(dateStr); const thDate = `${dObj.getDate()} / ${dObj.getMonth()+1} / ${dObj.getFullYear()}`;
+                let msg = `ข้อมูลวันที่ ${thDate}:\n\n`;
+                dayLogs.forEach(l => {
+                    if (l.type === 'period_status') return;
+                    let typeName = l.type === 'period' ? '🩸 ประจำเดือน' : (l.type === 'symptom' ? '🤕 อาการ' : (l.type === 'mood' ? '😊 อารมณ์' : (l.type === 'pill' ? '💊 กินยา' : (l.type === 'note' ? '📓 ไดอารี่' : (l.type === 'bbt' ? '🌡️ อุณหภูมิ' : (l.type === 'weight' ? '⚖️ น้ำหนัก' : '💧 น้ำ(แก้ว)'))))));
+                    let val = l.value;
+                    if(l.type === 'period') { val = val === 'spotting' ? 'กะปริบกะปรอย' : (val === 'light' ? 'มาน้อย' : (val === 'medium' ? 'ปานกลาง' : 'มามาก')); const statusLog = dayLogs.find(sl => sl.type === 'period_status'); if(statusLog) { val += statusLog.value === 'normal' ? ' (ปกติ)' : ' (ผิดปกติ)'; } }
+                    if(l.type === 'pill') val = 'ทานแล้ว';
+                    if(l.type === 'water') val = '1';
+                    if(l.type === 'bbt') val += ' °C';
+                    if(l.type === 'weight') val += ' kg';
+                    msg += `• ${typeName}: ${val}\n`;
+                });
+                this.showAlert('บันทึกสุขภาพ', msg, 'info');
+            },
+
+            renderStats() {
+                document.getElementById('stat-avg-cycle').innerText = this.currentUser.cycle; document.getElementById('stat-avg-duration').innerText = this.currentUser.duration;
+                const countOccurrences = (arr) => arr.reduce((acc, curr) => { acc[curr] = (acc[curr] || 0) + 1; return acc; }, {});
+                const symptoms = this.db.logs.filter(l => l.type === 'symptom').map(l => l.value); const topSymps = Object.entries(countOccurrences(symptoms)).sort((a,b) => b[1] - a[1]).slice(0,3);
+                const moods = this.db.logs.filter(l => l.type === 'mood').map(l => l.value); const topMoods = Object.entries(countOccurrences(moods)).sort((a,b) => b[1] - a[1]).slice(0,3);
+                const renderBadge = (arr, containerId, icon, colorClass, bgClass) => { const cont = document.getElementById(containerId); cont.innerHTML = ''; if (arr.length === 0) cont.innerHTML = '<span class="text-xs text-gray-400">ยังไม่มีข้อมูล</span>'; arr.forEach(item => { cont.innerHTML += `<span class="${bgClass} ${colorClass} px-3 py-1 rounded-full text-xs font-semibold shadow-sm"><i class="fa-solid ${icon} mr-1 opacity-70"></i> ${item[0]}</span>`; }); };
+                const isDark = this.theme === 'dark';
+                renderBadge(topSymps, 'top-symptoms', 'fa-band-aid', isDark?'text-purple-300':'text-purple-600', isDark?'bg-purple-900/40':'bg-purple-100');
+                renderBadge(topMoods, 'top-moods', 'fa-face-smile', isDark?'text-yellow-300':'text-yellow-600', isDark?'bg-yellow-900/40':'bg-yellow-100');
+                const ctx = document.getElementById('cycleChart').getContext('2d'); if (this.chartInstance) this.chartInstance.destroy();
+                const c = parseInt(this.currentUser.cycle); const mockData = [c-2, c+1, c, c-1, c, c]; 
+                const gridColor = isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)'; const textColor = isDark ? '#9ca3af' : '#6b7280';
+                this.chartInstance = new Chart(ctx, { type: 'bar', data: { labels: ['เดือน-5', 'เดือน-4', 'เดือน-3', 'เดือน-2', 'เดือนก่อน', 'เดือนนี้'], datasets: [{ label: 'ความยาวรอบเดือน (วัน)', data: mockData, backgroundColor: '#FF9A9E', borderRadius: 6, barPercentage: 0.5 }] }, options: { responsive: true, scales: { y: { beginAtZero: false, min: 20, max: 40, grid: { color: gridColor, borderDash: [4, 4] }, ticks: { color: textColor } }, x: { grid: { display: false }, ticks: { color: textColor } } }, plugins: { legend: { display: false } } } });
+            },
+
+            renderProfile() {
+                document.getElementById('profile-name').innerText = this.currentUser.name; document.getElementById('profile-user').innerText = '@' + this.currentUser.username;
+                document.getElementById('profile-cycle').innerText = this.currentUser.cycle; document.getElementById('profile-duration').innerText = this.currentUser.duration;
+                const pinBadge = document.getElementById('pin-status-badge');
+                if (this.currentUser.pin) { pinBadge.innerText = 'เปิดใช้งานแล้ว'; pinBadge.className = 'text-xs px-2 py-1 bg-green-100 dark:bg-green-900/40 text-green-600 dark:text-green-400 rounded-full font-medium transition-colors'; } 
+                else { pinBadge.innerText = 'ปิดใช้งาน'; pinBadge.className = 'text-xs px-2 py-1 bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 rounded-full font-medium transition-colors'; }
+            },
+            
+            async saveProfile() {
+                const name = document.getElementById('edit-name').value; const cycle = parseInt(document.getElementById('edit-cycle').value); const dur = parseInt(document.getElementById('edit-duration').value);
+                if(!name || !cycle || !dur) return this.showAlert('ผิดพลาด', 'กรุณากรอกข้อมูลให้ครบถ้วน', 'error');
+                
+                const data = await this.apiCall('update_profile', {name: name, cycle: cycle, duration: dur});
+                if(data.success) {
+                    this.currentUser = data.user;
+                    this.closeModal('edit-profile-modal'); this.renderProfile(); this.renderDashboard(); this.showAlert('สำเร็จ', 'อัปเดตข้อมูลในระบบเรียบร้อย', 'success');
+                }
+            },
+
+            // --- Admin Functions ---
+            async renderAdmin() {
+                const data = await this.apiCall('admin_dashboard', {});
+                if (data.success) {
+                    document.getElementById('admin-total-users').innerText = data.total_users;
+                    document.getElementById('admin-total-logs').innerText = data.total_logs;
+                    const tbody = document.getElementById('admin-user-list'); tbody.innerHTML = '';
+                    
+                    if (data.users.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="3" class="text-center p-4 text-gray-400">ไม่มีผู้ใช้งานในระบบ</td></tr>';
+                    } else {
+                        data.users.forEach(u => { 
+                            tbody.innerHTML += `<tr class="hover:bg-gray-50 dark:hover:bg-gray-700/50 border-b border-gray-50 dark:border-gray-700"><td class="p-3"><p class="font-semibold text-gray-800 dark:text-gray-200">${u.name}</p><p class="text-xs text-gray-500">@${u.username}</p><p class="text-[10px] text-gray-400">สมัครเมื่อ: ${u.created_at.split(' ')[0]}</p></td><td class="p-3 text-center text-sm font-medium text-gray-600 dark:text-gray-300"><span class="bg-blue-100 text-blue-600 px-2 py-1 rounded-lg">${u.log_count}</span></td><td class="p-3 text-center"><button onclick="app.adminDeleteUser('${u.id}')" class="text-red-400 hover:text-red-600 hover:bg-red-50 p-2 rounded-lg transition"><i class="fa-solid fa-trash-can"></i></button></td></tr>`; 
+                        });
+                    }
+                }
+            },
+            
+            adminDeleteUser(userId) { 
+                this.showConfirm('ลบผู้ใช้งาน', 'คุณแน่ใจหรือไม่ว่าต้องการลบผู้ใช้งานท่านนี้ และข้อมูลการบันทึกทั้งหมดของเขา? (เรียกคืนไม่ได้)', async () => { 
+                    const data = await this.apiCall('admin_delete_user', {id: userId});
+                    if(data.success) {
+                        this.renderAdmin();
+                        this.showAlert('สำเร็จ', 'ลบผู้ใช้งานออกจากระบบแล้ว');
+                    }
+                }); 
+            },
+
+            openModal(id) {
+                if(id === 'edit-profile-modal') { document.getElementById('edit-name').value = this.currentUser.name; document.getElementById('edit-cycle').value = this.currentUser.cycle; document.getElementById('edit-duration').value = this.currentUser.duration; }
+                if (id.includes('modal') && !['alert-modal', 'confirm-modal', 'edit-profile-modal', 'note-modal', 'bbt-modal', 'weight-modal'].includes(id)) {
+                    if (id === 'period-modal') { this.selectedTemp['period_flow'] = null; this.selectedTemp['period_status'] = null; const flowCont = document.getElementById('period_flow-options'); const statusCont = document.getElementById('period_status-options'); if(flowCont) flowCont.querySelectorAll('.btn-select').forEach(b => b.classList.remove('selected')); if(statusCont) statusCont.querySelectorAll('.btn-select').forEach(b => b.classList.remove('selected')); } 
+                    else { const type = id.split('-')[0]; this.selectedTemp[type] = null; const container = document.getElementById(`${type}-options`); if(container) container.querySelectorAll('.btn-select').forEach(b => b.classList.remove('selected')); }
+                }
+                document.getElementById(id).classList.add('active');
+            },
+            closeModal(id) { document.getElementById(id).classList.remove('active'); },
+            selectOption(type, value, btnElement) { this.selectedTemp[type] = value; const container = document.getElementById(`${type}-options`); container.querySelectorAll('.btn-select').forEach(b => b.classList.remove('selected')); btnElement.classList.add('selected'); }
+        };
+
+        window.onload = () => { app.init(); };
     </script>
 </body>
 </html>
